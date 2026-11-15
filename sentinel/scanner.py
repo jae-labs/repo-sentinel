@@ -145,6 +145,11 @@ def findings(report: dict[str, Any]) -> list[dict[str, str]]:
     return sorted(output, key=lambda x: (x['severity'] != 'CRITICAL', x['id'], x['package']))
 
 
+def priority_severity(value: Any) -> str:
+    severity = str(value).upper()
+    return severity if severity in {'CRITICAL', 'HIGH'} else ''
+
+
 def short_description(value: str, limit: int = 240) -> str:
     text = ' '.join(value.split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + '…'
@@ -182,16 +187,17 @@ def diagnostics_summary(info: dict[str, Any]) -> str:
             lines.append(f'- {len(errors) - 5} additional errors in scan.log.')
     count = info.get('dependency_files')
     if count is None:
-        lines.append('Dependency-file coverage: unknown (scanner did not report a count).')
+        lines.append('Trivy dependency files: unknown (scanner did not report a count).')
     elif count == 0:
-        lines.append('**Dependency-file coverage: no language-specific dependency files detected.**')
+        lines.append('**Trivy dependency files: no language-specific dependency files detected.**')
     else:
-        lines.append(f'Dependency-file coverage: {count} language-specific file(s) detected; this does not guarantee complete dependency coverage.')
+        lines.append(f'Trivy dependency files: {count} language-specific file(s) detected; this does not guarantee complete dependency coverage.')
     return '\n'.join(lines)
 
 
-def render_summary(repo: str, version: str, revision: dict[str, Any] | None, report: dict[str, Any] | None, status: str, limit: int = 200) -> str:
-    lines = [f'## {cell(repo)}', f'Requested version: `{cell(version)}`']
+def render_summary(repo: str, version: str, revision: dict[str, Any] | None, report: dict[str, Any] | None, status: str, limit: int = 12, *, image: bool = False) -> str:
+    label = 'Platform' if image else 'Requested version'
+    lines = [f'## {cell(repo)}', '', f'{label}: `{cell(version)}`']
     if revision:
         match = 'matched requested version' if revision['matched_version'] else 'default branch; requested version not matched'
         lines.append(f"Scanned commit: `{cell(str(revision['commit']))}` ({match})")
@@ -201,7 +207,8 @@ def render_summary(repo: str, version: str, revision: dict[str, Any] | None, rep
         lines.append('**Scan failed or did not produce a report. Check the job logs.**')
         return '\n\n'.join(lines) + '\n'
     rows = findings(report)
-    lines.append(f'**{len(rows)} high or critical findings.** Full JSON report is available in the job artifact.')
+    scan = 'image scan' if image else 'source scan'
+    lines.append(f'\n**Trivy {scan} reported {len(rows)} high or critical findings.**\n')
     if rows:
         lines.append('| Severity | Advisory | Finding | Package or target | Version | Fixed |\n| --- | --- | --- | --- | --- | --- |')
         for item in rows[:limit]:

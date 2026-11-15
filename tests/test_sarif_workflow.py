@@ -7,33 +7,39 @@ from pathlib import Path
 
 
 class SarifWorkflowTests(unittest.TestCase):
-    def test_osv_exit_codes_do_not_abort_following_scanners(self):
+    def test_exports_available_findings_without_rerunning_scanners(self):
         repo = Path(__file__).resolve().parents[1]
         workflow = (repo / '.github/workflows/reusable-scan.yml').read_text()
         step = workflow.split('      - name: Generate sanitized SARIF artifacts\n', 1)[1].split('      - name: Summarize findings\n', 1)[0]
         block = step.split('        run: |\n', 1)[1]
         script = '\n'.join(line[10:] for line in block.splitlines() if line.startswith('          ')) + '\n'
-        document = json.dumps({'version': '2.1.0', 'runs': [{'tool': {'driver': {'name': 'mock'}}, 'results': []}]})
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            bins = root / 'bin'; bins.mkdir()
-            (root / 'target').mkdir()
-            (root / 'results.json').write_text('{}')
+            bins = root / 'bin'
+            bins.mkdir()
             (root / 'script.sh').write_text(script)
-            (bins / 'trivy').write_text('#!/bin/bash\nprintf %s ' + repr(document) + ' > "$5"\n')
-            (bins / 'osv-scanner').write_text('#!/bin/bash\nprintf %s ' + repr(document) + '\nexit "$OSV_FAKE_EXIT"\n')
-            (bins / 'bandit').write_text('#!/bin/bash\nwhile [[ $# -gt 0 ]]; do if [[ "$1" == --output ]]; then shift; printf %s ' + repr(document) + ' > "$1"; break; fi; shift; done\n')
-            for executable in bins.iterdir():
+            for name in ('osv-scanner', 'bandit'):
+                executable = bins / name
+                executable.write_text('#!/bin/bash\ntouch unexpectedly-reran\nexit 127\n')
                 executable.chmod(0o755)
-            for code in (0, 1, 128, 127):
-                for path in root.glob('*.sarif'):
-                    path.unlink()
-                env = dict(os.environ, PATH=str(bins) + os.pathsep + os.environ['PATH'], PYTHONPATH=str(repo), RUNNER_TEMP=str(root), OSV_FAKE_EXIT=str(code), PYTHONDONTWRITEBYTECODE='1')
-                result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(root / 'script.sh')], cwd=root, env=env, text=True, capture_output=True)
-                with self.subTest(code=code):
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertTrue((root / 'results.sarif').exists(), result.stdout + result.stderr)
-                    self.assertTrue((root / 'bandit.sarif').exists(), result.stdout + result.stderr)
-                    self.assertEqual((root / 'osv.sarif').exists(), code in (0, 1))
-                    if code == 127:
-                        self.assertIn('OSV SARIF scan failed', result.stdout)
+            env = dict(os.environ, PATH=str(bins) + os.pathsep + os.environ['PATH'],
+                       PYTHONPATH=str(repo), RUNNER_TEMP=str(root), PYTHONDONTWRITEBYTECODE='1')
+            for osv_status in ('completed', 'incomplete'):
+                with self.subTest(osv_status=osv_status):
+                    (root / 'osv.sarif').unlink(missing_ok=True)
+                    (root / 'specialized.json').write_text(json.dumps({
+                        'coverage': [{'scanner': 'OSV-Scanner', 'status': osv_status},
+                                     {'scanner': 'Bandit', 'status': 'completed'}],
+                        'findings': [{'scanner': 'Bandit', 'rule': 'B101', 'path': './target/test_sample.py',
+                                      'line': 7, 'severity': 'LOW', 'description': 'omitted scan text'},
+                                     {'scanner': 'OSV-Scanner', 'rule': 'GHSA-test', 'severity': 'HIGH'}],
+                    }))
+                    subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(root / 'script.sh')],
+                                   cwd=root, env=env, text=True, capture_output=True, check=True)
+                    self.assertFalse((root / 'unexpectedly-reran').exists())
+                    self.assertEqual((root / 'osv.sarif').exists(), osv_status == 'completed')
+                    payload = (root / 'bandit.sarif').read_text()
+                    self.assertNotIn('omitted scan text', payload)
+                    result = json.loads(payload)['runs'][0]['results'][0]
+                    self.assertEqual(result['ruleId'], 'B101')
+                    self.assertEqual(result['locations'][0]['physicalLocation']['artifactLocation']['uri'], 'test_sample.py')

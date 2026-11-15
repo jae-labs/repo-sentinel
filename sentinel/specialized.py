@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 
+OSV_TIMEOUT_SECONDS = 300
+
+
 def detect(root: Path) -> dict[str, list[Path]]:
     found: dict[str, list[Path]] = {'python': [], 'docker': [], 'go': [], 'dependencies': []}
     dependency_names = {'requirements.txt', 'requirements-dev.txt', 'pyproject.toml', 'poetry.lock', 'uv.lock', 'Pipfile.lock', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'go.mod', 'Cargo.lock', 'Gemfile.lock', 'composer.lock'}
@@ -77,6 +80,14 @@ def fixed_versions(vulnerability: dict[str, Any], package: dict[str, Any]) -> li
                     versions.add(event['fixed'])
     return sorted(versions)
 
+def advisory_severity(vulnerability: dict[str, Any]) -> str:
+    metadata = vulnerability.get('database_specific')
+    value = str(metadata.get('severity', '')).upper() if isinstance(metadata, dict) else ''
+    if value in {'CRITICAL', 'HIGH', 'MEDIUM', 'MODERATE', 'LOW'}:
+        return value
+    return 'UNRATED'
+
+
 def scan(root: Path) -> dict[str, Any]:
     files = detect(root)
     findings: list[dict[str, Any]] = []
@@ -90,7 +101,7 @@ def scan(root: Path) -> dict[str, Any]:
             # Do not let the target's own configuration suppress vulnerabilities.
             with tempfile.NamedTemporaryFile(mode='w', suffix='.toml') as config:
                 config.flush()
-                result = timed_run(['osv-scanner', 'scan', 'source', '-r', '--no-ignore', '--config', config.name, '--format', 'json', str(root)], env=env)
+                result = timed_run(['osv-scanner', 'scan', 'source', '-r', '--no-ignore', '--config', config.name, '--format', 'json', str(root)], env=env, timeout=OSV_TIMEOUT_SECONDS)
             data = json.loads(result.stdout) if result.stdout.strip() else {}
             if result.returncode not in (0, 1, 128):
                 raise ValueError(f'scanner exited {result.returncode}')
@@ -101,7 +112,7 @@ def scan(root: Path) -> dict[str, Any]:
                 for package in group.get('packages', []):
                     pkg = package.get('package') or {}
                     for vuln in package.get('vulnerabilities', []):
-                        findings.append({'scanner': 'OSV-Scanner', 'rule': str(vuln.get('id') or 'unknown'), 'path': source, 'line': None, 'severity': 'advisory', 'description': str(pkg.get('name') or 'unknown') + '@' + str(pkg.get('version') or 'unknown') + ': ' + str(vuln.get('summary') or 'Known dependency vulnerability'), 'package': str(pkg.get('name') or 'unknown'), 'version': str(pkg.get('version') or 'unknown'), 'aliases': [str(a) for a in vuln.get('aliases', []) if isinstance(a, str)], 'url': 'https://osv.dev/vulnerability/' + str(vuln.get('id') or ''), 'fixed': fixed_versions(vuln, pkg)})
+                        findings.append({'scanner': 'OSV-Scanner', 'rule': str(vuln.get('id') or 'unknown'), 'path': source, 'line': None, 'severity': advisory_severity(vuln), 'description': str(pkg.get('name') or 'unknown') + '@' + str(pkg.get('version') or 'unknown') + ': ' + str(vuln.get('summary') or 'Known dependency vulnerability'), 'package': str(pkg.get('name') or 'unknown'), 'ecosystem': str(pkg.get('ecosystem') or ''), 'version': str(pkg.get('version') or 'unknown'), 'aliases': [str(a) for a in vuln.get('aliases', []) if isinstance(a, str)], 'url': 'https://osv.dev/vulnerability/' + str(vuln.get('id') or ''), 'fixed': fixed_versions(vuln, pkg)})
             warnings = sum(1 for line in result.stderr.splitlines() if any(word in line.lower() for word in ('warning', 'warn ', 'error', 'failed', 'unable to')))
             detail = 'No packages found.' if result.returncode == 128 else 'Dependency advisories checked.'
             if warnings:
@@ -109,7 +120,9 @@ def scan(root: Path) -> dict[str, Any]:
             if files['go']:
                 detail += ' Go call analysis is attempted; review scanner output for unsupported modules and build configurations.'
             coverage.append({'scanner': 'OSV-Scanner', 'status': 'partial' if warnings else ('no packages' if result.returncode == 128 else 'completed'), 'detail': detail})
-        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired:
+            coverage.append({'scanner': 'OSV-Scanner', 'status': 'incomplete', 'detail': f'Dependency scan timed out after {OSV_TIMEOUT_SECONDS // 60} minutes.'})
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
             coverage.append({'scanner': 'OSV-Scanner', 'status': 'incomplete', 'detail': f'Unable to finish or parse report: {type(exc).__name__}.'})
     if not files['python']:
         coverage.append({'scanner': 'Bandit', 'status': 'not applicable', 'detail': 'No Python files detected.'})

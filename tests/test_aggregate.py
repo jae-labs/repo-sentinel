@@ -21,15 +21,14 @@ class CombinedReportTests(unittest.TestCase):
                 (folder / 'revision.json').write_text(json.dumps({'repository': target.repo, 'requested_version': target.version, 'commit': 'abcd', 'matched_version': index == 0}))
                 (folder / 'results.json').write_text(json.dumps({'SchemaVersion': 2, 'Results': [{'Target': 'Dockerfile', 'Misconfigurations': [{'ID': 'DS-1', 'Severity': 'HIGH', 'Message': 'Container runs as root'}]}]}))
             report = combined_report(targets, root)
-            self.assertIn('2/3 scan reports available; 1 incomplete; 1 used an unmatched', report)
-            self.assertIn('0 critical, 2 high', report)
-            self.assertIn('2 have partial scans', report)
-            self.assertIn('1 detected no Trivy dependency files', report)
-            self.assertIn('scanner ERROR test', report)
+            self.assertIn('2/3 Trivy source reports available. 3 targets have coverage gaps, including 1 source version fallbacks', report)
+            self.assertIn('0 critical and 2 high', report)
+            self.assertIn('Trivy detected no dependency files', report)
+            self.assertIn('Trivy source errors or missing diagnostics', report)
             self.assertIn('Container runs as root', report)
-            self.assertIn('| c/three | v3 | **Incomplete**', report)
+            self.assertIn('| c/three | v3 | **revision unavailable, Trivy source unavailable', report)
             (root / 'scan-1' / 'results.json').write_text('{broken')
-            self.assertIn('1/3 scan reports available; 2 incomplete', combined_report(targets, root))
+            self.assertIn('1/3 Trivy source reports available', combined_report(targets, root))
 
     def test_scanner_counts_image_and_advisory_aliases(self):
         target = Target('a/b', 'v1', 'example/image:1', 'linux/arm64')
@@ -46,10 +45,9 @@ class CombinedReportTests(unittest.TestCase):
             extra = {'scanner': 'specialized', 'coverage': [], 'findings': [{'scanner': 'OSV-Scanner', 'rule': 'GHSA-test', 'aliases': ['CVE-2026-1234'], 'package': 'pkg', 'version': '1', 'path': 'lock'}]}
             (folder / 'specialized.json').write_text(json.dumps(extra))
             report = combined_report([target], root)
-            self.assertIn('OSV-Scanner: 1', report)
-            self.assertIn('Trivy image: 1', report)
-            self.assertIn('1 potential Trivy/OSV duplicate', report)
-            self.assertIn('image tag mutable', report)
+            self.assertIn('1 unrated OSV entries', report)
+            self.assertIn('| HIGH | a/b | Trivy image | CVE-2026-1234', report)
+            self.assertIn('mutable image tag', report)
             self.assertIn('source coverage warning', report)
 
     def test_other_scanners_survive_trivy_failure(self):
@@ -57,11 +55,11 @@ class CombinedReportTests(unittest.TestCase):
             folder = Path(tmp) / 'scan-0'
             folder.mkdir()
             (folder / 'status.json').write_text(json.dumps({'repository': 'a/b', 'version': 'v1', 'clone_outcome': 'success', 'scan_outcome': 'failure', 'semgrep_outcome': 'success'}))
-            (folder / 'semgrep.json').write_text(json.dumps({'scanner': 'semgrep', 'findings': [{'rule': 'test-rule', 'path': 'file', 'line': 2}]}))
+            (folder / 'semgrep.json').write_text(json.dumps({'scanner': 'semgrep', 'findings': [{'rule': 'test-rule', 'path': 'file', 'line': 2, 'severity': 'ERROR'}]}))
             report = combined_report([Target('a/b', 'v1')], Path(tmp))
-            self.assertIn('Incomplete', report)
-            self.assertIn('test-rule', report)
-            self.assertIn('### Semgrep', report)
+            self.assertIn('Trivy source unavailable', report)
+            self.assertIn('1 Semgrep ERROR results', report)
+            self.assertNotIn('Semgrep unavailable', report)
 
     def test_status_failure_not_treated_as_success(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,7 +68,7 @@ class CombinedReportTests(unittest.TestCase):
             (folder / 'status.json').write_text(json.dumps({'repository': 'a/b', 'version': 'v1', 'clone_outcome': 'success', 'scan_outcome': 'failure'}))
             (folder / 'revision.json').write_text(json.dumps({'repository': 'a/b', 'requested_version': 'v1', 'commit': 'abcd', 'matched_version': True}))
             (folder / 'results.json').write_text(json.dumps({'Results': []}))
-            self.assertIn('0/1 scan reports available; 1 incomplete', combined_report([Target('a/b', 'v1')], Path(tmp)))
+            self.assertIn('0/1 Trivy source reports available', combined_report([Target('a/b', 'v1')], Path(tmp)))
 
     def test_excerpt_is_bounded_and_utf8_safe(self):
         excerpt = summary_excerpt(('hello é\n' * 100), byte_limit=200)

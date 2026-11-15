@@ -72,3 +72,32 @@ def sanitized_sarif(value: Any) -> dict[str, Any]:
 def sanitize_file(source: Path, destination: Path) -> None:
     value = json.loads(source.read_text(encoding='utf-8'))
     destination.write_text(json.dumps(sanitized_sarif(value), indent=2) + '\n', encoding='utf-8')
+
+
+def export_specialized_sarif(report: dict[str, Any], destination: Path) -> None:
+    """Export existing normalized findings without executing a scanner again."""
+    for scanner, filename in (('OSV-Scanner', 'osv.sarif'), ('Bandit', 'bandit.sarif')):
+        coverage = next((entry for entry in report['coverage'] if entry['scanner'] == scanner), None)
+        if not coverage or coverage['status'] not in {'completed', 'partial'}:
+            continue
+        rows = []
+        for item in report['findings']:
+            if item['scanner'] != scanner:
+                continue
+            path = str(item.get('path') or '').removeprefix('./')
+            severity = str(item.get('severity') or '').upper()
+            row: dict[str, Any] = {
+                'ruleId': item['rule'],
+                'locations': [{'physicalLocation': {
+                    'artifactLocation': {'uri': path},
+                    'region': {'startLine': item.get('line')},
+                }}],
+            }
+            level = {'CRITICAL': 'error', 'HIGH': 'error', 'MEDIUM': 'warning',
+                     'MODERATE': 'warning', 'LOW': 'note'}.get(severity)
+            row['level'] = level or 'none'
+            rows.append(row)
+        safe = sanitized_sarif({'version': '2.1.0', 'runs': [
+            {'tool': {'driver': {'name': scanner}}, 'results': rows},
+        ]})
+        (destination / filename).write_text(json.dumps(safe, separators=(',', ':')) + '\n', encoding='utf-8')

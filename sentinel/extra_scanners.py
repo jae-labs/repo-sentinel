@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import quote
 from typing import Any
 
-from sentinel.scanner import cell, short_description
+from sentinel.scanner import cell, priority_severity, short_description
 
 
 def normalize_semgrep(raw: Any) -> dict[str, Any]:
@@ -53,12 +53,12 @@ def dependency_scope(path: str) -> str:
 def grouped_findings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Merge OSV aliases only for the same package, version and source path."""
     output: list[dict[str, Any]] = []
-    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     for item in rows:
         if item.get('scanner') != 'OSV-Scanner' or not item.get('package') or not item.get('version'):
             output.append(dict(item))
             continue
-        key = tuple(str(item.get(field, '')).lower() for field in ('package', 'version', 'path'))
+        key = tuple(str(item.get(field, '')).lower() for field in ('ecosystem', 'package', 'version', 'path'))
         ids = {str(item.get('rule', '')).upper(), *(str(a).upper() for a in item.get('aliases', []) if isinstance(a, str))}
         matches = [group for group in groups.get(key, []) if ids & group['_ids']]
         if matches:
@@ -82,13 +82,13 @@ def grouped_findings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 item['description'] = str(item.get('description', '')) + '; grouped advisories: ' + ', '.join(rules)
     return output
 
-def render_extra(name: str, status: str, report: dict[str, Any] | None, limit: int = 200) -> str:
+def render_extra(name: str, status: str, report: dict[str, Any] | None, limit: int = 12) -> str:
     if status != 'success' or report is None:
         return f'### {name}\n\n**Incomplete or unavailable.** Check the scanner job logs.\n'
     rows = report.get('findings')
     if report.get('scanner') != name.lower() or not isinstance(rows, list):
         raise ValueError(f'Invalid {name} report')
-    message = f'### {name}\n\n**{len(rows)} finding(s).**'
+    message = f'### {name}\n\n'
     if name.lower() == 'specialized':
         for entry in report.get('coverage', []):
             message += f"\n- **{cell(str(entry.get('scanner', 'unknown')))}:** {cell(str(entry.get('status', 'unknown')))} — {cell(str(entry.get('detail', '')))}"
@@ -100,10 +100,20 @@ def render_extra(name: str, status: str, report: dict[str, Any] | None, limit: i
             message += f" {label}: {count if count is not None else 'unknown'}."
     if report.get('errors'):
         message += f" **Partial: {report['errors']} scanner error(s).**"
-    display_rows = grouped_findings(rows) if name.lower() == 'specialized' else rows
-    if len(display_rows) != len(rows):
-        message += f' {len(display_rows)} displayed after grouping same-package advisory aliases; original findings remain in the artifact.'
-    if rows:
+    if name.lower() == 'semgrep':
+        display_rows = [item for item in rows if str(item.get('severity')).upper() == 'ERROR']
+        message += f'\n\n**{len(display_rows)} Semgrep ERROR results.**'
+        hidden = len(rows) - len(display_rows)
+    else:
+        high_rows = [item for item in rows if priority_severity(item.get('severity'))]
+        display_rows = grouped_findings(high_rows)
+        display_rows.sort(key=lambda item: (item['severity'].upper() != 'CRITICAL', dependency_scope(str(item.get('path', ''))) == 'development/test'))
+        unrated = sum(item.get('scanner') == 'OSV-Scanner' and str(item.get('severity', '')).upper() in {'UNRATED', 'ADVISORY', ''} for item in rows)
+        message += f'\n\n**{len(display_rows)} high or critical results after alias grouping.** {unrated} OSV advisory entries without a severity label.'
+        hidden = len(rows) - len(display_rows)
+    if hidden:
+        message += f' {hidden} additional entries in the JSON artifact.'
+    if display_rows:
         message += '\n\n| Scanner | Rule | Finding | Location | Severity |\n| --- | --- | --- | --- | --- |\n'
         for item in display_rows[:limit]:
             line = item.get('line') or '—'

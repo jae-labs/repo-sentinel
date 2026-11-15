@@ -83,6 +83,26 @@ class SpecializedTests(unittest.TestCase):
             self.assertEqual(bandit['status'], 'completed')
             self.assertTrue(any(row['rule'] == 'B101' for row in result['findings']))
 
+    def test_osv_timeout_keeps_other_scanner_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'main.py').write_text('pass')
+
+            def fake_run(args, **kwargs):
+                if args[0] == 'osv-scanner':
+                    self.assertEqual(kwargs['timeout'], 300)
+                    raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+                return subprocess.CompletedProcess(args, 0, json.dumps({
+                    'results': [{'test_id': 'B608', 'issue_severity': 'HIGH'}], 'errors': [],
+                }), '')
+
+            with patch('sentinel.specialized.shutil.which', return_value='/bin/tool'), patch('sentinel.specialized.run', side_effect=fake_run) as runner:
+                result = scan(root)
+            self.assertEqual(result['coverage'][0]['status'], 'incomplete')
+            self.assertIn('timed out after 5 minutes', result['coverage'][0]['detail'])
+            self.assertEqual([call.args[0][0] for call in runner.call_args_list], ['osv-scanner', 'bandit'])
+            self.assertEqual([row['rule'] for row in result['findings']], ['B608'])
+
     def test_empty_target_is_not_a_clean_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = scan(Path(tmp))
