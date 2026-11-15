@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ COMMIT = re.compile(r'[0-9a-fA-F]{7,40}\Z')
 class Target:
     repo: str
     version: str
+    image: str = ''
+    platform: str = ''
 
 
 def parse_inventory(value: Any) -> list[Target]:
@@ -35,16 +38,26 @@ def parse_inventory(value: Any) -> list[Target]:
             raise ValueError(f'Duplicate repository: {repo}')
         if not isinstance(version, str) or not VERSION.fullmatch(version) or version in ('.', '..') or version.startswith('-'):
             raise ValueError(f'Invalid version: {version!r}')
+        image, platform = item.get('image', ''), item.get('platform', '')
+        if not isinstance(image, str) or (image and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@-]{0,254}', image)):
+            raise ValueError(f'Invalid image: {image!r}')
+        if '@sha256:' in image and not re.search(r'@sha256:[0-9a-fA-F]{64}$', image):
+            raise ValueError('Image digest must be a complete SHA-256')
+        if not isinstance(platform, str) or (platform and not re.fullmatch(r'[a-z0-9_]+/[a-z0-9_]+(?:/[a-z0-9_]+)?', platform)):
+            raise ValueError(f'Invalid image platform: {platform!r}')
+        if platform and not image:
+            raise ValueError('An image platform requires an image')
         seen.add(repo.lower())
-        targets.append(Target(repo, version))
+        targets.append(Target(repo, version, image, platform))
     return targets
 
 
 def run_git(path: Path | None, *args: str) -> subprocess.CompletedProcess[str]:
-    command = ['git', '-c', 'core.hooksPath=/dev/null']
+    command = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=']
     if path is not None:
         command += ['-C', str(path)]
-    return subprocess.run(command + list(args), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_LFS_SKIP_SMUDGE='1', GIT_ALLOW_PROTOCOL='https')
+    return subprocess.run(command + list(args), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=env, timeout=900)
 
 
 def resolve_revision(path: Path, version: str, git: Callable[..., subprocess.CompletedProcess[str]] = run_git) -> tuple[str, bool]:
@@ -57,6 +70,12 @@ def resolve_revision(path: Path, version: str, git: Callable[..., subprocess.Com
         result = git(path, 'rev-parse', '--verify', f'{version}^{{commit}}')
         if result.returncode == 0:
             return result.stdout.strip(), True
+        if len(version) == 40:
+            fetched = git(path, 'fetch', '--no-tags', 'origin', version)
+            if fetched.returncode == 0:
+                verified = git(path, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}')
+                if verified.returncode == 0 and verified.stdout.strip().lower() == version.lower():
+                    return verified.stdout.strip(), True
     result = git(path, 'rev-parse', '--verify', 'HEAD^{commit}')
     if result.returncode:
         raise RuntimeError('Unable to resolve default branch revision')
@@ -67,11 +86,43 @@ def clone_target(target: Target, path: Path) -> dict[str, Any]:
     result = run_git(None, 'clone', '--quiet', '--no-checkout', '--filter=blob:none', f'https://github.com/{target.repo}.git', str(path))
     if result.returncode:
         raise RuntimeError(f'Clone failed: {result.stderr.strip()}')
+    warnings: list[str] = []
+    try:
+        tag_fetch = run_git(path, 'fetch', '--tags', 'origin')
+        if tag_fetch.returncode:
+            warnings.append('Some remote tags could not be fetched; history coverage is incomplete.')
+    except subprocess.TimeoutExpired:
+        warnings.append('Tag fetch timed out; history coverage is incomplete.')
     commit, matched = resolve_revision(path, target.version)
     result = run_git(path, 'checkout', '--quiet', '--detach', commit)
     if result.returncode:
         raise RuntimeError(f'Checkout failed: {result.stderr.strip()}')
-    return {'repository': target.repo, 'requested_version': target.version, 'commit': commit, 'matched_version': matched}
+    if (path / '.gitmodules').exists():
+        try:
+            submodules = run_git(path, 'submodule', 'update', '--init', '--recursive')
+            if submodules.returncode:
+                warnings.append('One or more submodules could not be fetched; source coverage is incomplete.')
+            else:
+                warnings.append('Submodules fetched at recorded commits; their Git history and Git LFS content are not verified.')
+        except subprocess.TimeoutExpired:
+            warnings.append('Submodule fetch timed out; source coverage is incomplete.')
+    try:
+        lfs = run_git(path, 'lfs', 'ls-files', '--name-only')
+        if lfs.returncode:
+            warnings.append('Git LFS status unavailable; LFS coverage is unknown.')
+        elif lfs.stdout.strip():
+            pulled = run_git(path, 'lfs', 'pull')
+            if pulled.returncode:
+                warnings.append('Git LFS objects could not be fetched; source coverage is incomplete.')
+    except subprocess.TimeoutExpired:
+        warnings.append('Git LFS operation timed out; source coverage is incomplete.')
+    for _, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = [directory for directory in dirs if directory != '.git']
+        if '.semgrepignore' in files:
+            warnings.append('Semgrep ignore files may exclude source files from analysis.')
+            break
+    return {'repository': target.repo, 'requested_version': target.version, 'commit': commit, 'matched_version': matched, 'source_warnings': warnings}
+
 
 
 def findings(report: dict[str, Any]) -> list[dict[str, str]]:
@@ -89,13 +140,54 @@ def findings(report: dict[str, Any]) -> list[dict[str, str]]:
                     'fixed': str(item.get('FixedVersion') or '—'),
                     'url': str(item.get('PrimaryURL') or ''),
                     'target': str(result.get('Target') or 'unknown'),
-                    'title': str(item.get('Title') or item.get('Message') or ''),
+                    'title': str((item.get('Message') if key == 'Misconfigurations' else item.get('Title')) or item.get('Description') or item.get('Title') or item.get('Message') or 'No description provided'),
                 })
     return sorted(output, key=lambda x: (x['severity'] != 'CRITICAL', x['id'], x['package']))
 
 
+def short_description(value: str, limit: int = 240) -> str:
+    text = ' '.join(value.split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + '…'
+
+
 def cell(value: str) -> str:
     return value.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('|', '&#124;').replace('\n', ' ').replace('\r', ' ')
+
+
+def scan_diagnostics(log: str | None) -> dict[str, Any]:
+    if log is None:
+        return {'available': False, 'errors': [], 'dependency_files': None}
+    errors = []
+    file_count = None
+    for line in log.splitlines():
+        if re.search(r'\bERROR\b', line):
+            errors.append(line.strip())
+        if 'Number of language-specific files' in line:
+            match = re.search(r'\bnum[=:]\s*(\d+)', line)
+            if match:
+                file_count = int(match.group(1))
+    return {'available': True, 'errors': errors, 'dependency_files': file_count}
+
+
+def diagnostics_summary(info: dict[str, Any]) -> str:
+    if not info.get('available'):
+        return '**Scan diagnostics unavailable; coverage cannot be verified.**'
+    lines = []
+    errors = info.get('errors', [])
+    if errors:
+        lines.append(f'**Partial scan: {len(errors)} scanner error(s).** Some checks may not have completed; see scan.log in the artifact.')
+        for error in errors[:5]:
+            lines.append(f'- {cell(short_description(error, 350))}')
+        if len(errors) > 5:
+            lines.append(f'- {len(errors) - 5} additional errors in scan.log.')
+    count = info.get('dependency_files')
+    if count is None:
+        lines.append('Dependency-file coverage: unknown (scanner did not report a count).')
+    elif count == 0:
+        lines.append('**Dependency-file coverage: no language-specific dependency files detected.**')
+    else:
+        lines.append(f'Dependency-file coverage: {count} language-specific file(s) detected; this does not guarantee complete dependency coverage.')
+    return '\n'.join(lines)
 
 
 def render_summary(repo: str, version: str, revision: dict[str, Any] | None, report: dict[str, Any] | None, status: str, limit: int = 200) -> str:
@@ -103,19 +195,21 @@ def render_summary(repo: str, version: str, revision: dict[str, Any] | None, rep
     if revision:
         match = 'matched requested version' if revision['matched_version'] else 'default branch; requested version not matched'
         lines.append(f"Scanned commit: `{cell(str(revision['commit']))}` ({match})")
+        for warning in revision.get('source_warnings', []):
+            lines.append('**Source coverage:** ' + cell(str(warning)))
     if status != 'success' or report is None:
         lines.append('**Scan failed or did not produce a report. Check the job logs.**')
         return '\n\n'.join(lines) + '\n'
     rows = findings(report)
     lines.append(f'**{len(rows)} high or critical findings.** Full JSON report is available in the job artifact.')
     if rows:
-        lines.append('| Severity | Advisory | Package or target | Version | Fixed |\n| --- | --- | --- | --- | --- |')
+        lines.append('| Severity | Advisory | Finding | Package or target | Version | Fixed |\n| --- | --- | --- | --- | --- | --- |')
         for item in rows[:limit]:
             ident = cell(item['id'])
             url = item['url']
             if url.startswith('https://') and not re.search(r'[\s()<>]', url):
                 ident = f'[{ident}]({quote(url, safe=":/#?&=%._~-+;")})'
-            lines.append(f"| {cell(item['severity'])} | {ident} | {cell(item['package'])} | {cell(item['installed'])} | {cell(item['fixed'])} |")
+            lines.append(f"| {cell(item['severity'])} | {ident} | {cell(short_description(item['title']))} | {cell(item['package'])} | {cell(item['installed'])} | {cell(item['fixed'])} |")
         if len(rows) > limit:
             lines.append(f'\nShowing {limit} of {len(rows)} findings; see the JSON artifact for the full report.')
     return '\n'.join(lines) + '\n'

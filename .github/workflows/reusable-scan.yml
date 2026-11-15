@@ -25,7 +25,7 @@ jobs:
     needs: inventory
     if: needs.inventory.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -37,29 +37,129 @@ jobs:
         with:
           persist-credentials: false
       - name: Clone and resolve requested version
+        timeout-minutes: 15
+        id: clone
         env:
           TARGET_REPO: ${{ matrix.target.repo }}
           TARGET_VERSION: ${{ matrix.target.version }}
         run: python3 -m sentinel clone
-      - name: Scan dependencies and configuration
-        id: trivy
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
         with:
           version: v0.76.2
-          scan-type: fs
-          scan-ref: target
-          scanners: vuln,misconfig
-          severity: HIGH,CRITICAL
-          format: json
-          output: results.json
-          exit-code: '0'
           cache: 'false'
+      - name: Scan dependencies and configuration
+        id: trivy
+        shell: bash
+        run: |
+          set +e
+          trivy fs --timeout 20m --scanners vuln,misconfig --severity HIGH,CRITICAL --format json --output results.json --exit-code 0 --no-progress target 2>scan.log
+          scan_exit=$?
+          cat scan.log
+          exit "$scan_exit"
+      - name: Scan explicitly configured container image
+        id: image
+        if: ${{ always() && steps.clone.outcome == 'success' && matrix.target.image != '' }}
+        env:
+          IMAGE_REF: ${{ matrix.target.image }}
+          IMAGE_PLATFORM: ${{ matrix.target.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$IMAGE_PLATFORM" ]]; then args+=(--platform "$IMAGE_PLATFORM"); fi
+          trivy image --timeout 20m --image-src remote --scanners vuln --severity HIGH,CRITICAL --format json --output image-results.json --exit-code 0 --no-progress "${args[@]}" "$IMAGE_REF" 2>image-scan.log
+      - name: Install Semgrep
+        id: semgrep_install
+        if: ${{ always() && steps.clone.outcome == 'success' }}
+        run: python3 -m pip install 'semgrep==1.185.0'
+      - name: Scan source code with Semgrep
+        id: semgrep
+        if: ${{ always() && steps.clone.outcome == 'success' && steps.semgrep_install.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="$RUNNER_TEMP/semgrep-raw.json"
+          log="$RUNNER_TEMP/semgrep.log"
+          trap 'rm -f "$raw" "$log"' EXIT
+          if ! timeout 20m semgrep scan --config p/security-audit --disable-nosem --metrics=off --disable-version-check --no-git-ignore --json --output "$raw" target 2>"$log"; then
+            echo 'Semgrep failed; scanner output withheld because it may contain source text.' >&2
+            exit 1
+          fi
+          python3 -m sentinel normalize semgrep "$raw" semgrep.json
+      - name: Install Gitleaks
+        id: gitleaks_install
+        if: ${{ always() && steps.clone.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error --retry 3 -o "$RUNNER_TEMP/gitleaks.tar.gz" https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  '"$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan checked-out files for secrets
+        id: gitleaks
+        if: ${{ always() && steps.clone.outcome == 'success' && steps.gitleaks_install.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="$RUNNER_TEMP/gitleaks-raw.json"
+          config="$RUNNER_TEMP/gitleaks-config.toml"
+          trap 'rm -f "$raw" "$config"' EXIT
+          printf '[extend]\nuseDefault = true\n' > "$config"
+          "$RUNNER_TEMP/gitleaks" dir target --config "$config" --gitleaks-ignore-path /dev/null --ignore-gitleaks-allow --redact=100 --no-banner --exit-code 0 --report-format json --report-path "$raw" --timeout 1200
+          python3 -m sentinel normalize gitleaks "$raw" gitleaks.json
+      - name: Scan selected revision history for secrets
+        id: gitleaks_history
+        if: ${{ always() && steps.clone.outcome == 'success' && steps.gitleaks_install.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="$RUNNER_TEMP/gitleaks-history-raw.json"
+          config="$RUNNER_TEMP/gitleaks-history-config.toml"
+          trap 'rm -f "$raw" "$config"' EXIT
+          printf '[extend]\nuseDefault = true\n' > "$config"
+          "$RUNNER_TEMP/gitleaks" git target --log-opts='--all HEAD' --config "$config" --gitleaks-ignore-path /dev/null --ignore-gitleaks-allow --redact=100 --no-banner --exit-code 0 --report-format json --report-path "$raw" --timeout 1800
+          python3 -m sentinel normalize gitleaks_history "$raw" gitleaks_history.json
+      - name: Install OSV-Scanner
+        if: ${{ always() && steps.clone.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/osv-scanner" https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64
+          echo 'fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8  '"$RUNNER_TEMP/osv-scanner" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Install Bandit
+        if: ${{ always() && steps.clone.outcome == 'success' }}
+        run: python3 -m pip install 'bandit==1.9.4'
+      - name: Install Hadolint
+        if: ${{ always() && steps.clone.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/hadolint" https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64
+          echo 'c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507  '"$RUNNER_TEMP/hadolint" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/hadolint"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Scan detected languages and Dockerfiles
+        timeout-minutes: 45
+        id: specialized
+        if: ${{ always() && steps.clone.outcome == 'success' }}
+        run: python3 -m sentinel specialized target
       - name: Summarize findings
         if: always()
         env:
           TARGET_REPO: ${{ matrix.target.repo }}
           TARGET_VERSION: ${{ matrix.target.version }}
           SCAN_OUTCOME: ${{ steps.trivy.outcome }}
+          CLONE_OUTCOME: ${{ steps.clone.outcome }}
+          SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+          GITLEAKS_HISTORY_OUTCOME: ${{ steps.gitleaks_history.outcome }}
+          SPECIALIZED_OUTCOME: ${{ steps.specialized.outcome }}
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+          IMAGE_REF: ${{ matrix.target.image }}
+          IMAGE_PLATFORM: ${{ matrix.target.platform }}
         run: python3 -m sentinel summary
       - name: Save full report
         if: always()
@@ -69,5 +169,39 @@ jobs:
           path: |
             results.json
             revision.json
+            status.json
+            scan.log
+            diagnostics.json
+            gitleaks.json
+            gitleaks_history.json
+            semgrep.json
+            specialized.json
+            image-results.json
+            image-scan.log
           if-no-files-found: warn
+          retention-days: 30
+  summary:
+    name: Combined scan summary
+    needs: [inventory, scan]
+    if: ${{ always() && needs.inventory.result == 'success' && needs.inventory.outputs.has_targets == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download scan reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: scan-*
+          path: scan-artifacts
+          merge-multiple: false
+      - name: Combine reports
+        env:
+          INVENTORY: ${{ inputs.inventory }}
+        run: python3 -m sentinel aggregate "$INVENTORY" scan-artifacts
+      - name: Save combined report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: combined-report
+          path: combined-report.md
           retention-days: 30

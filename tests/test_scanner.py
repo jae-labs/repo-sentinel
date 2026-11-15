@@ -5,8 +5,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from sentinel.scanner import findings, parse_inventory, render_summary, resolve_revision
+from sentinel.scanner import Target, clone_target, findings, parse_inventory, render_summary, resolve_revision, scan_diagnostics, diagnostics_summary
 
 
 class InventoryTests(unittest.TestCase):
@@ -21,6 +22,13 @@ class InventoryTests(unittest.TestCase):
                       [{'repo': 'A/b', 'version': '1'}, {'repo': 'a/B', 'version': '2'}]):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_inventory(value)
+
+    def test_optional_image_and_platform_validation(self):
+        target = parse_inventory([{'repo': 'a/b', 'version': 'v1', 'image': 'ghcr.io/a/b@sha256:' + 'a' * 64, 'platform': 'linux/arm64'}])[0]
+        self.assertEqual(target.platform, 'linux/arm64')
+        for extra in ({'image': 'bad image'}, {'image': 'a/b@sha256:abcd'}, {'platform': 'linux/arm64'}, {'image': 'a/b', 'platform': '../../x'}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                parse_inventory([{'repo': 'a/b', 'version': 'v1', **extra}])
 
     def test_empty_inventory_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,21 +58,51 @@ class RevisionTests(unittest.TestCase):
                 self.assertEqual(resolve_revision(path, version), (commit, True))
             self.assertEqual(resolve_revision(path, 'not-a-tag'), (commit, False))
 
+    def test_clone_fetches_tags_before_resolving_and_warns_on_missing_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'target'
+            calls = []
+            def fake_git(where, *args):
+                calls.append(args)
+                if args[0] == 'clone':
+                    path.mkdir(); (path / '.gitmodules').write_text('[submodule]')
+                code = 1 if args[:2] == ('submodule', 'update') or args[:2] == ('lfs', 'ls-files') else 0
+                return subprocess.CompletedProcess(args, code, '', '')
+            def fake_resolve(where, version):
+                self.assertIn(('fetch', '--tags', 'origin'), calls)
+                return 'abc', True
+            with patch('sentinel.scanner.run_git', side_effect=fake_git), patch('sentinel.scanner.resolve_revision', side_effect=fake_resolve):
+                revision = clone_target(Target('owner/repo', 'v1'), path)
+            self.assertTrue(any('submodules' in x for x in revision['source_warnings']))
+            self.assertTrue(any('LFS' in x for x in revision['source_warnings']))
+
 
 class ReportTests(unittest.TestCase):
     def test_findings_and_render(self):
         report = {'Results': [{'Target': 'package-lock.json', 'Vulnerabilities': [
-            {'VulnerabilityID': 'CVE-1', 'Severity': 'HIGH', 'PkgName': 'a|b', 'InstalledVersion': '1', 'FixedVersion': '2', 'PrimaryURL': 'https://example.org/CVE-1'},
+            {'VulnerabilityID': 'CVE-1', 'Severity': 'HIGH', 'PkgName': 'a|b', 'Title': 'Request smuggling | issue', 'InstalledVersion': '1', 'FixedVersion': '2', 'PrimaryURL': 'https://example.org/CVE-1'},
             {'VulnerabilityID': 'CVE-2', 'Severity': 'LOW'}],
-            'Misconfigurations': [{'ID': 'DS-1', 'Severity': 'CRITICAL'}]}]}
+            'Misconfigurations': [{'ID': 'DS-1', 'Severity': 'CRITICAL', 'Title': 'Missing USER', 'Message': 'Container runs as root'}]}]}
         rows = findings(report)
         self.assertEqual([row['id'] for row in rows], ['DS-1', 'CVE-1'])
         summary = render_summary('owner/repo', 'v1', {'commit': 'abc', 'matched_version': False}, report, 'success')
         self.assertIn('2 high or critical', summary)
         self.assertIn('a&#124;b', summary)
+        self.assertIn('Request smuggling &#124; issue', summary)
+        self.assertIn('Container runs as root', summary)
         self.assertIn('requested version not matched', summary)
         self.assertIn('[CVE-1](https://example.org/CVE-1)', summary)
         self.assertIn('Showing 1 of 2', render_summary('o/r', 'v', None, report, 'success', limit=1))
+
+    def test_trivy_diagnostics_and_unknown_coverage(self):
+        log = '2026-11-15T14:54:35Z\tERROR\t[dockerfile scanner] Failed to parse file\n2026-11-15T14:54:37Z\tINFO\tNumber of language-specific files\tnum=0\n'
+        result = scan_diagnostics(log)
+        self.assertEqual(result['dependency_files'], 0)
+        self.assertEqual(len(result['errors']), 1)
+        self.assertIn('Partial scan', diagnostics_summary(result))
+        self.assertIn('no language-specific dependency files detected', diagnostics_summary(result))
+        self.assertIn('unknown', diagnostics_summary(scan_diagnostics('INFO scan started')))
+        self.assertIn('unavailable', diagnostics_summary(scan_diagnostics(None)))
 
     def test_scan_failure_not_clean(self):
         self.assertIn('Scan failed', render_summary('o/r', 'v', None, None, 'failure'))
