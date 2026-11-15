@@ -139,8 +139,11 @@ jobs:
           rm -f "$raw"
           : > "$config"
           if command -v osv-scanner >/dev/null; then
-            env CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org timeout 20m osv-scanner scan source -r --no-ignore --config "$config" --format sarif target > "$raw" 2>/dev/null
-            code=$?
+            if env CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org timeout 20m osv-scanner scan source -r --no-ignore --config "$config" --format sarif target > "$raw" 2>/dev/null; then
+              code=0
+            else
+              code=$?
+            fi
             if [[ "$code" == 0 || "$code" == 1 ]]; then
               python3 -m sentinel sanitize-sarif "$raw" osv.sarif || echo '::warning::OSV SARIF unavailable or invalid.'
             elif [[ "$code" != 128 ]]; then
