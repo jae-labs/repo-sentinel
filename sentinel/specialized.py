@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,24 @@ def run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None 
     return subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout, check=False)
 
 
+
+def diagnostic_category(stderr: str) -> str:
+    """Classify diagnostics without persisting untrusted paths or scanner text."""
+    text = stderr.lower()
+    labels = []
+    for words, label in ((('timeout', 'timed out', 'deadline exceeded'), 'timeout'), (('429', 'rate limit'), 'rate limiting'), (('network', 'connection', 'dns', 'no such host'), 'network or DNS'), (('parse', 'parsing', 'invalid format'), 'input parsing'), (('permission denied', 'access denied'), 'access denied')):
+        if any(word in text for word in words):
+            labels.append(label)
+    return ', '.join(labels) if labels else 'unclassified; raw output withheld'
+
+
+def timed_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    start = time.monotonic()
+    try:
+        return run(args, **kwargs)
+    finally:
+        print(f"{args[0]} elapsed: {time.monotonic() - start:.1f}s", flush=True)
+
 def scan(root: Path) -> dict[str, Any]:
     files = detect(root)
     findings: list[dict[str, Any]] = []
@@ -49,7 +68,7 @@ def scan(root: Path) -> dict[str, Any]:
             # Do not let the target's own configuration suppress vulnerabilities.
             with tempfile.NamedTemporaryFile(mode='w', suffix='.toml') as config:
                 config.flush()
-                result = run(['osv-scanner', 'scan', 'source', '-r', '--no-ignore', '--config', config.name, '--format', 'json', str(root)], env=env)
+                result = timed_run(['osv-scanner', 'scan', 'source', '-r', '--no-ignore', '--config', config.name, '--format', 'json', str(root)], env=env)
             data = json.loads(result.stdout) if result.stdout.strip() else {}
             if result.returncode not in (0, 1, 128):
                 raise ValueError(f'scanner exited {result.returncode}')
@@ -64,7 +83,7 @@ def scan(root: Path) -> dict[str, Any]:
             warnings = sum(1 for line in result.stderr.splitlines() if any(word in line.lower() for word in ('warning', 'warn ', 'error', 'failed', 'unable to')))
             detail = 'No packages found.' if result.returncode == 128 else 'Dependency advisories checked.'
             if warnings:
-                detail += f' Scanner reported {warnings} warning/error line(s); some checks may be incomplete.'
+                detail += f' Scanner reported {warnings} warning/error line(s); category: {diagnostic_category(result.stderr)}; some checks may be incomplete.'
             if files['go']:
                 detail += ' Go call analysis is attempted; review scanner output for unsupported modules and build configurations.'
             coverage.append({'scanner': 'OSV-Scanner', 'status': 'partial' if warnings else ('no packages' if result.returncode == 128 else 'completed'), 'detail': detail})
@@ -75,17 +94,38 @@ def scan(root: Path) -> dict[str, Any]:
     elif not shutil.which('bandit'):
         coverage.append({'scanner': 'Bandit', 'status': 'incomplete', 'detail': 'Scanner unavailable.'})
     else:
-        try:
-            result = run(['bandit', '-r', str(root), '-f', 'json', '--exit-zero', '--ignore-nosec'])
-            data = json.loads(result.stdout)
-            if result.returncode != 0 or not isinstance(data.get('results'), list):
-                raise ValueError('Bandit failed')
-            for item in data['results']:
-                findings.append({'scanner': 'Bandit', 'rule': str(item.get('test_id') or 'unknown'), 'path': str(item.get('filename') or 'unknown'), 'line': item.get('line_number'), 'severity': str(item.get('issue_severity') or 'unknown'), 'description': re.sub(r'[^a-zA-Z0-9_-]', '', str(item.get('test_name') or 'Python security issue')).replace('_', ' ')})
-            errors = data.get('errors') or []
-            coverage.append({'scanner': 'Bandit', 'status': 'partial' if errors else 'completed', 'detail': f"{len(files['python'])} Python files detected; {len(errors)} scanner errors."})
-        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-            coverage.append({'scanner': 'Bandit', 'status': 'incomplete', 'detail': f'Unable to finish or parse report: {type(exc).__name__}.'})
+        errors = 0
+        reasons: list[str] = []
+        successful_batches = 0
+        python_files = files['python']
+        # Bound memory and command size; preserve findings from successful batches.
+        for offset in range(0, len(python_files), 100):
+            batch = python_files[offset:offset + 100]
+            try:
+                result = timed_run(['bandit', '-f', 'json', '--exit-zero', '--ignore-nosec', *(str(path) for path in batch)])
+                if result.returncode != 0:
+                    raise ValueError(f'exit {result.returncode}; {diagnostic_category(result.stderr)}')
+                data = json.loads(result.stdout)
+                if not isinstance(data, dict) or not isinstance(data.get('results'), list):
+                    raise ValueError('invalid JSON report')
+                for item in data['results']:
+                    findings.append({'scanner': 'Bandit', 'rule': str(item.get('test_id') or 'unknown'), 'path': str(item.get('filename') or 'unknown'), 'line': item.get('line_number'), 'severity': str(item.get('issue_severity') or 'unknown'), 'description': re.sub(r'[^a-zA-Z0-9_-]', '', str(item.get('test_name') or 'Python security issue')).replace('_', ' ')})
+                errors += len(data.get('errors') or [])
+                successful_batches += 1
+            except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired) as exc:
+                errors += len(batch)
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    reasons.append('batch timed out')
+                elif isinstance(exc, json.JSONDecodeError):
+                    reasons.append('invalid or empty JSON output')
+                elif isinstance(exc, ValueError):
+                    reasons.append(str(exc))
+                else:
+                    reasons.append(type(exc).__name__)
+        detail = f"{len(python_files)} Python files detected; {errors} file or scanner error(s)."
+        if reasons:
+            detail += ' ' + '; '.join(sorted(set(reasons))) + '.'
+        coverage.append({'scanner': 'Bandit', 'status': ('partial' if successful_batches else 'incomplete') if errors else 'completed', 'detail': detail})
     if not files['docker']:
         coverage.append({'scanner': 'Hadolint', 'status': 'not applicable', 'detail': 'No Dockerfiles detected.'})
     elif not shutil.which('hadolint'):
@@ -94,7 +134,7 @@ def scan(root: Path) -> dict[str, Any]:
         errors = 0
         for path in files['docker']:
             try:
-                result = run(['hadolint', '--no-fail', '--disable-ignore-pragma', '--format', 'json', str(path)], timeout=120)
+                result = timed_run(['hadolint', '--no-fail', '--disable-ignore-pragma', '--format', 'json', str(path)], timeout=120)
                 data = json.loads(result.stdout)
                 if result.returncode != 0 or not isinstance(data, list):
                     raise ValueError('Hadolint failed')

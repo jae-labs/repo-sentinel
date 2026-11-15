@@ -24,7 +24,7 @@ class CombinedReportTests(unittest.TestCase):
             self.assertIn('2/3 scan reports available; 1 incomplete; 1 used an unmatched', report)
             self.assertIn('0 critical, 2 high', report)
             self.assertIn('2 have partial scans', report)
-            self.assertIn('1 detected no dependency files', report)
+            self.assertIn('1 detected no Trivy dependency files', report)
             self.assertIn('scanner ERROR test', report)
             self.assertIn('Container runs as root', report)
             self.assertIn('| c/three | v3 | **Incomplete**', report)

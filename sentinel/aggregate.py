@@ -21,7 +21,7 @@ def read_object(path: Path) -> dict[str, Any]:
 def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path | None = None) -> str:
     overview: list[str] = []
     details: list[str] = []
-    completed = failed = unmatched = partial = no_dependencies = high = critical = 0
+    completed = failed = unmatched = partial = unknown_semgrep = no_dependencies = high = critical = 0
     scanner_counts: Counter[str] = Counter({'Trivy': 0, 'Trivy image': 0, 'semgrep': 0, 'OSV-Scanner': 0, 'Bandit': 0, 'Hadolint': 0})
     possible_duplicates = 0
     for index, target in enumerate(targets):
@@ -81,7 +81,7 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
                                 if any(row['id'].lower() in aliases and row['package'].lower() == str(item.get('package', '')).lower() and row['installed'] == str(item.get('version', '')) for row in rows):
                                     possible_duplicates += 1
                     if name == 'semgrep' and extra.get('skipped_files') is None:
-                        target_partial = True
+                        unknown_semgrep += 1
                         match += '; semgrep skipped-file coverage unknown'
                     if extra.get('errors') or extra.get('skipped_files') or extra.get('skipped_rules') or any(item.get('status') in ('partial', 'incomplete') for item in extra.get('coverage', [])):
                         target_partial = True
@@ -153,7 +153,7 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
     heading = (f'# Combined scan report\n\n'
                f'**{completed}/{len(targets)} scan reports available; {failed} incomplete; '
                f'{unmatched} used an unmatched default branch; {partial} have partial scans or unavailable diagnostics; '
-               f'{no_dependencies} detected no dependency files.**\n\n'
+               f'{unknown_semgrep} have unknown Semgrep skipped-file coverage; {no_dependencies} detected no Trivy dependency files.**\n\n'
                f'**Trivy findings:** {critical} critical, {high} high. Counts are findings, not unique vulnerabilities.\n\n'
                f'**Findings by scanner:** {cell(", ".join(f"{name}: {count}" for name, count in sorted(scanner_counts.items())) or "none reported")}. '
                f'{possible_duplicates} potential Trivy/OSV duplicate(s) match by advisory, package and version; results are retained for review. '

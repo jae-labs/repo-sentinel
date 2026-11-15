@@ -40,6 +40,27 @@ class SpecializedTests(unittest.TestCase):
             self.assertEqual([item['status'] for item in result['coverage']], ['completed', 'completed', 'partial'])
             self.assertEqual({item['rule'] for item in result['findings']}, {'CVE-TEST', 'B101'})
 
+    def test_bandit_batches_preserve_successes_when_one_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for n in range(101):
+                (root / f'file{n:03}.py').write_text('pass')
+            calls = []
+            def fake_run(args, **kwargs):
+                if args[0] == 'osv-scanner':
+                    return subprocess.CompletedProcess(args, 128, '', '')
+                calls.append(args)
+                if len(calls) == 2:
+                    return subprocess.CompletedProcess(args, -9, '', 'sensitive diagnostic')
+                return subprocess.CompletedProcess(args, 0, json.dumps({'results': [{'test_id': 'B101', 'filename': 'file.py'}], 'errors': []}), '')
+            with patch('sentinel.specialized.shutil.which', return_value='/bin/tool'), patch('sentinel.specialized.run', side_effect=fake_run):
+                result = scan(root)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(result['coverage'][1]['status'], 'partial')
+            self.assertIn('exit -9', result['coverage'][1]['detail'])
+            self.assertNotIn('sensitive diagnostic', str(result))
+            self.assertEqual(len(result['findings']), 1)
+
     def test_empty_target_is_not_a_clean_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = scan(Path(tmp))

@@ -38,6 +38,50 @@ def normalize_file(scanner: str, source: Path, destination: Path) -> None:
     destination.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 
 
+
+def dependency_scope(path: str) -> str:
+    """Classify only clear development/test paths; otherwise make no runtime claim."""
+    parts = path.lower().replace('\\', '/').split('/')
+    filename = parts[-1]
+    if any(part in {'test', 'tests', 'testing', 'dev', 'development', 'docs', 'examples'} for part in parts[:-1]):
+        return 'development/test'
+    if re.search(r'(^|[._-])(dev|test|testing|docs)([._-]|$)', filename):
+        return 'development/test'
+    return 'unclassified'
+
+
+def grouped_findings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge OSV aliases only for the same package, version and source path."""
+    output: list[dict[str, Any]] = []
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for item in rows:
+        if item.get('scanner') != 'OSV-Scanner' or not item.get('package') or not item.get('version'):
+            output.append(dict(item))
+            continue
+        key = tuple(str(item.get(field, '')).lower() for field in ('package', 'version', 'path'))
+        ids = {str(item.get('rule', '')).upper(), *(str(a).upper() for a in item.get('aliases', []) if isinstance(a, str))}
+        matches = [group for group in groups.get(key, []) if ids & group['_ids']]
+        if matches:
+            group = matches[0]
+            group['_ids'].update(ids)
+            for other in matches[1:]:
+                group['_ids'].update(other['_ids'])
+                group['_rules'].update(other['_rules'])
+                groups[key].remove(other)
+                output.remove(other)
+            group['_rules'].add(str(item.get('rule', '')))
+        else:
+            group = dict(item, _ids=ids, _rules={str(item.get('rule', ''))})
+            groups.setdefault(key, []).append(group)
+            output.append(group)
+    for item in output:
+        if '_rules' in item:
+            rules = sorted(item.pop('_rules'))
+            item.pop('_ids')
+            if len(rules) > 1:
+                item['description'] = str(item.get('description', '')) + '; grouped advisories: ' + ', '.join(rules)
+    return output
+
 def render_extra(name: str, status: str, report: dict[str, Any] | None, limit: int = 200) -> str:
     if status != 'success' or report is None:
         return f'### {name}\n\n**Incomplete or unavailable.** Check the scanner job logs.\n'
@@ -56,9 +100,12 @@ def render_extra(name: str, status: str, report: dict[str, Any] | None, limit: i
             message += f" {label}: {count if count is not None else 'unknown'}."
     if report.get('errors'):
         message += f" **Partial: {report['errors']} scanner error(s).**"
+    display_rows = grouped_findings(rows) if name.lower() == 'specialized' else rows
+    if len(display_rows) != len(rows):
+        message += f' {len(display_rows)} displayed after grouping same-package advisory aliases; original findings remain in the artifact.'
     if rows:
         message += '\n\n| Scanner | Rule | Finding | Location | Severity |\n| --- | --- | --- | --- | --- |\n'
-        for item in rows[:limit]:
+        for item in display_rows[:limit]:
             line = item.get('line') or '—'
             revision = f" @ {str(item['commit'])[:12]}" if item.get('commit') else ''
             rule = cell(short_description(str(item.get('rule') or 'unknown')))
@@ -66,10 +113,12 @@ def render_extra(name: str, status: str, report: dict[str, Any] | None, limit: i
             if url.startswith(('https://osv.dev/vulnerability/', 'https://github.com/hadolint/hadolint/wiki/')) and not re.search(r'[\s()<>]', url):
                 rule = f'[{rule}]({quote(url, safe=":/#?&=%._~-+;")})'
             description = str(item.get('description') or 'See rule identifier')
+            if item.get('scanner') == 'OSV-Scanner':
+                description += '; scope: ' + dependency_scope(str(item.get('path') or ''))
             fixed = item.get('fixed')
             if isinstance(fixed, list) and fixed:
                 description += '; advisory fixed version(s): ' + ', '.join(str(x) for x in fixed)
             message += f"| {cell(str(item.get('scanner') or name))} | {rule} | {cell(short_description(description))} | {cell(short_description(str(item.get('path') or 'unknown')))}:{cell(str(line))}{cell(revision)} | {cell(str(item.get('severity') or 'not rated'))} |\n"
-        if len(rows) > limit:
-            message += f'\nShowing {limit} of {len(rows)} findings; see the JSON artifact.\n'
+        if len(display_rows) > limit:
+            message += f'\nShowing {limit} of {len(display_rows)} displayed findings; see the JSON artifact.\n'
     return message + '\n'

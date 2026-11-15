@@ -40,6 +40,7 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
     except (OSError, ValueError, TypeError):
         return heading + '**CISA catalog unavailable or invalid. Exploitation status is unknown.**\n\n'
     matches: dict[tuple[str, str], set[str]] = defaultdict(set)
+    evidence: dict[tuple[str, str], set[tuple[str, str, str, str]]] = defaultdict(set)
     for index, target in enumerate(targets):
         directory = artifacts / f'scan-{index}'
         try:
@@ -67,6 +68,7 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
                                 ids.extend(item[field])
                         for cve in finding_cves(ids) & catalog.keys():
                             matches[(target.repo, cve)].add(scanner)
+                            evidence[(target.repo, cve)].add((str(item.get('PkgName') or 'unknown'), str(item.get('InstalledVersion') or 'unknown'), str(item.get('FixedVersion') or 'unknown'), str(result.get('Target') or 'unknown')))
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
         if status.get('specialized_outcome') == 'success':
@@ -80,6 +82,8 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
                     aliases = item.get('aliases') if isinstance(item.get('aliases'), list) else []
                     for cve in finding_cves([item.get('rule'), *aliases]) & catalog.keys():
                         matches[(target.repo, cve)].add('OSV-Scanner')
+                        fixed = item.get('fixed') if isinstance(item.get('fixed'), list) else []
+                        evidence[(target.repo, cve)].add((str(item.get('package') or 'unknown'), str(item.get('version') or 'unknown'), ', '.join(map(str, fixed)) or 'unknown', str(item.get('path') or 'unknown')))
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
     text = heading + f'[CISA catalog]({CATALOG_URL}) released {cell(released)}. '
@@ -87,8 +91,11 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
     text += 'Only available findings with CVE identifiers or aliases are matched; missing results or aliases limit coverage.\n\n'
     if not matches:
         return text + '**No CISA matches in the available findings.**\n\n'
-    text += f'**{len(matches)} repository/CVE match(es).**\n\n| Repository | CVE | Scanner(s) | CISA date added |\n| --- | --- | --- | --- |\n'
+    text += f'**{len(matches)} repository/CVE match(es).**\n\n| Repository | CVE | Scanner(s) | Package, version and fix | Source | CISA date added |\n| --- | --- | --- | --- | --- | --- |\n'
     for (repo, cve), scanners in sorted(matches.items()):
         added = str(catalog[cve].get('dateAdded') or 'unknown')
-        text += f'| {cell(repo)} | [{cve}](https://www.cve.org/CVERecord?id={cve}) | {cell(", ".join(sorted(scanners)))} | {cell(added)} |\n'
+        entries = sorted(evidence[(repo, cve)])
+        packages = '<br>'.join(cell(f'{package} {version}; fixed: {fixed}') for package, version, fixed, _ in entries)
+        sources = '<br>'.join(cell(source) for _, _, _, source in entries)
+        text += f'| {cell(repo)} | [{cve}](https://www.cve.org/CVERecord?id={cve}) | {cell(", ".join(sorted(scanners)))} | {packages} | {sources} | {cell(added)} |\n'
     return text + '\n'
