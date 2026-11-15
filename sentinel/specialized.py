@@ -88,7 +88,7 @@ def advisory_severity(vulnerability: dict[str, Any]) -> str:
     return 'UNRATED'
 
 
-def scan(root: Path) -> dict[str, Any]:
+def scan(root: Path, *, resolve_osv: bool = True) -> dict[str, Any]:
     files = detect(root)
     findings: list[dict[str, Any]] = []
     coverage: list[dict[str, Any]] = []
@@ -101,7 +101,10 @@ def scan(root: Path) -> dict[str, Any]:
             # Do not let the target's own configuration suppress vulnerabilities.
             with tempfile.NamedTemporaryFile(mode='w', suffix='.toml') as config:
                 config.flush()
-                result = timed_run(['osv-scanner', 'scan', 'source', '-r', '--no-ignore', '--config', config.name, '--format', 'json', str(root)], env=env, timeout=OSV_TIMEOUT_SECONDS)
+                args = ['osv-scanner', 'scan', 'source', '-r', '--no-ignore', '--config', config.name, '--format', 'json']
+                if not resolve_osv:
+                    args.append('--no-resolve')
+                result = timed_run([*args, str(root)], env=env, timeout=OSV_TIMEOUT_SECONDS)
             data = json.loads(result.stdout) if result.stdout.strip() else {}
             if result.returncode not in (0, 1, 128):
                 raise ValueError(f'scanner exited {result.returncode}')
@@ -115,11 +118,13 @@ def scan(root: Path) -> dict[str, Any]:
                         findings.append({'scanner': 'OSV-Scanner', 'rule': str(vuln.get('id') or 'unknown'), 'path': source, 'line': None, 'severity': advisory_severity(vuln), 'description': str(pkg.get('name') or 'unknown') + '@' + str(pkg.get('version') or 'unknown') + ': ' + str(vuln.get('summary') or 'Known dependency vulnerability'), 'package': str(pkg.get('name') or 'unknown'), 'ecosystem': str(pkg.get('ecosystem') or ''), 'version': str(pkg.get('version') or 'unknown'), 'aliases': [str(a) for a in vuln.get('aliases', []) if isinstance(a, str)], 'url': 'https://osv.dev/vulnerability/' + str(vuln.get('id') or ''), 'fixed': fixed_versions(vuln, pkg)})
             warnings = sum(1 for line in result.stderr.splitlines() if any(word in line.lower() for word in ('warning', 'warn ', 'error', 'failed', 'unable to')))
             detail = 'No packages found.' if result.returncode == 128 else 'Dependency advisories checked.'
+            if not resolve_osv:
+                detail += ' OSV transitive resolution disabled. Results use dependency versions extracted from source files.'
             if warnings:
                 detail += f' Scanner reported {warnings} warning/error line(s); category: {diagnostic_category(result.stderr)}; some checks may be incomplete.'
             if files['go']:
                 detail += ' Go call analysis is attempted; review scanner output for unsupported modules and build configurations.'
-            coverage.append({'scanner': 'OSV-Scanner', 'status': 'partial' if warnings else ('no packages' if result.returncode == 128 else 'completed'), 'detail': detail})
+            coverage.append({'scanner': 'OSV-Scanner', 'status': 'partial' if warnings else ('no packages' if result.returncode == 128 else 'completed'), 'detail': detail, 'transitive_resolution': resolve_osv})
         except subprocess.TimeoutExpired:
             coverage.append({'scanner': 'OSV-Scanner', 'status': 'incomplete', 'detail': f'Dependency scan timed out after {OSV_TIMEOUT_SECONDS // 60} minutes.'})
         except (OSError, ValueError, TypeError, AttributeError) as exc:

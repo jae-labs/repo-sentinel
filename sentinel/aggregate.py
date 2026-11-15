@@ -70,6 +70,9 @@ def priority_table(rows: list[dict[str, str]]) -> str:
 
 
 def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path | None = None) -> str:
+    if not targets:
+        return '# Combined scan report\n\nNo targets configured.\n'
+
     overview: list[str] = []
     priority: list[dict[str, str]] = []
     available = partial = unmatched = unknown_semgrep = 0
@@ -149,6 +152,8 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
                     detail = str(entry.get('detail', ''))
                     issue = 'timed out' if 'timed out' in detail.lower() or 'TimeoutExpired' in detail else entry['status']
                     gaps.append(f'{scanner} {issue}')
+                if entry.get('scanner') == 'OSV-Scanner' and entry.get('transitive_resolution') is False:
+                    gaps.append('OSV transitive resolution disabled')
             rows = specialized['findings']
             unrated = sum(row.get('scanner') == 'OSV-Scanner' and str(row.get('severity', '')).upper() in {'ADVISORY', 'UNRATED', ''} for row in rows)
             if unrated:
@@ -202,7 +207,7 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
              'Counts are high and critical rows. A dash means unavailable or inapplicable.\n\n'
              '| Repository | Requested version | Coverage and notes | Source | Image | Other | SARIF |\n'
              '| --- | --- | --- | ---: | ---: | ---: | --- |\n')
-    return heading + kev_section(targets, artifacts, catalog_path) + priority_table(priority) + table + '\n'.join(overview or ['| No targets configured | — | — | — | — | — | — |']) + '\n'
+    return heading + kev_section(targets, artifacts, catalog_path) + priority_table(priority) + table + '\n'.join(overview) + '\n'
 
 
 def summary_excerpt(report: str, byte_limit: int = 900_000) -> str:

@@ -27,7 +27,7 @@
   {"repo":"AlexxIT/SonoffLAN","version":"v3.13.3","kind":"marketplace"},
   {"repo":"Mincka/spotcast","version":"v6.6.7","kind":"marketplace"},
   {"repo":"stewartoallen/state-history-card","version":"v0.1.6","kind":"marketplace"},
-  {"repo":"tamaygz/hacs-stremio","version":"v0.5.46","kind":"marketplace"},
+  {"repo":"tamaygz/hacs-stremio","version":"v0.5.46","kind":"marketplace","osv_resolve":false},
   {"repo":"weedpump/timeline-card","version":"v1.13.0","kind":"marketplace"},
   {"repo":"bullitt186/ha-omada-open-api","version":"v1.12.0","kind":"marketplace"},
   {"repo":"hultenvp/solis-sensor","version":"3.7.2","kind":"integration","note":"Installed integration manifest identifies this repository and version"}

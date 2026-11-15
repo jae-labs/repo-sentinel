@@ -21,6 +21,7 @@ class Target:
     version: str
     image: str = ''
     platform: str = ''
+    osv_resolve: bool = True
 
 
 def parse_inventory(value: Any) -> list[Target]:
@@ -47,8 +48,11 @@ def parse_inventory(value: Any) -> list[Target]:
             raise ValueError(f'Invalid image platform: {platform!r}')
         if platform and not image:
             raise ValueError('An image platform requires an image')
+        osv_resolve = item.get('osv_resolve', True)
+        if not isinstance(osv_resolve, bool):
+            raise ValueError('osv_resolve must be a boolean')
         seen.add(repo.lower())
-        targets.append(Target(repo, version, image, platform))
+        targets.append(Target(repo, version, image, platform, osv_resolve))
     return targets
 
 

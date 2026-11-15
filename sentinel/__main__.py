@@ -43,11 +43,8 @@ def main() -> int:
         with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as out:
             print('targets=' + json.dumps([asdict(t) for t in targets], separators=(',', ':')), file=out)
             print('has_targets=' + str(bool(targets)).lower(), file=out)
-        if not targets:
-            with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as out:
-                out.write('No scan targets configured.\n')
     elif args.command == 'specialized':
-        result = specialized_scan(args.path)
+        result = specialized_scan(args.path, resolve_osv=os.environ.get('OSV_RESOLVE') != 'false')
         Path('specialized.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
         if any(entry['status'] in ('incomplete', 'partial') for entry in result['coverage']):
             print('::warning::One or more specialized scans did not complete; see summary.')
@@ -62,7 +59,7 @@ def main() -> int:
         revision = clone_target(target, Path('target'))
         Path('revision.json').write_text(json.dumps(revision, indent=2) + '\n', encoding='utf-8')
         if revision.get('source_warnings'):
-            print('::warning::Some source components require review; see the revision summary.')
+            print('::warning::Some source components require review; see the scan artifact.')
         if not revision['matched_version']:
             print(f'::warning::Requested version not found for {target.repo}; scanning default branch.')
     elif args.command == 'aggregate':
@@ -96,7 +93,7 @@ def main() -> int:
                     coverage_notes.append(f"{entry['scanner']} {entry['status']}")
         if coverage_notes:
             summary = summary.replace('\n\n', '\n\n**Coverage needs review:** ' + ', '.join(coverage_notes) + '.\n\n', 1)
-        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as out:
+        with Path('scan-report.md').open('w', encoding='utf-8') as out:
             out.write(summary + '\n' + diagnostics_summary(diagnostics) + '\n')
             image = os.environ['IMAGE_REF']
             if image:
@@ -113,7 +110,7 @@ def main() -> int:
             for name, scanner_report in scanner_reports.items():
                 out.write('\n' + render_extra(name.title(), os.environ[name.upper() + '_OUTCOME'], scanner_report))
         if diagnostics['errors']:
-            print('::warning::Trivy logged scanner errors; results may be incomplete. See the scan summary and artifact.')
+            print('::warning::Trivy logged scanner errors; results may be incomplete. See the scan artifact.')
         if os.environ['SCAN_OUTCOME'] != 'success' or report is None:
             print('::error::Scan did not complete successfully; see job logs.')
     return 0

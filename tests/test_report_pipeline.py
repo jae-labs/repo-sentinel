@@ -26,12 +26,13 @@ class ReportPipelineTests(unittest.TestCase):
             }
             for name, data in fake.items():
                 executable = bins / name
-                executable.write_text('#!/usr/bin/env python3\nimport json\nprint(' + repr(json.dumps(data)) + ')\n')
+                check_args = 'import sys\nassert "--no-resolve" in sys.argv\n' if name == 'osv-scanner' else ''
+                executable.write_text('#!/usr/bin/env python3\n' + check_args + 'print(' + repr(json.dumps(data)) + ')\n')
                 executable.chmod(0o755)
             env = dict(os.environ, PYTHONPATH=str(source), PATH=str(bins) + os.pathsep + os.environ['PATH'], PYTHONDONTWRITEBYTECODE='1')
             def cli(*args, extra=None):
                 return subprocess.run([sys.executable, '-m', 'sentinel', *map(str, args)], cwd=root, env=dict(env, **(extra or {})), text=True, capture_output=True, check=True)
-            cli('specialized', target)
+            cli('specialized', target, extra={'OSV_RESOLVE': 'false'})
             self.assertEqual(len(json.loads((root / 'specialized.json').read_text())['findings']), 4)
             raw = root / 'semgrep-raw.json'
             raw.write_text(json.dumps({'results': [{'check_id': 'python.security.example', 'path': 'code.py', 'start': {'line': 1}, 'extra': {'severity': 'ERROR', 'message': 'redaction-sentinel'}}], 'errors': [], 'paths': {'scanned': ['code.py']}}))
@@ -43,10 +44,12 @@ class ReportPipelineTests(unittest.TestCase):
             summary = root / 'summary.md'
             status = {'TARGET_REPO': 'a/b', 'TARGET_VERSION': 'v1', 'SCAN_OUTCOME': 'success', 'CLONE_OUTCOME': 'success', 'SEMGREP_OUTCOME': 'success', 'SPECIALIZED_OUTCOME': 'success', 'IMAGE_OUTCOME': 'skipped', 'IMAGE_REF': '', 'IMAGE_PLATFORM': '', 'GITHUB_STEP_SUMMARY': str(summary)}
             cli('summary', extra=status)
-            self.assertIn('B307', summary.read_text())
-            self.assertNotIn('B101', summary.read_text())
+            self.assertFalse(summary.exists())
+            scan_report = (root / 'scan-report.md').read_text()
+            self.assertIn('B307', scan_report)
+            self.assertNotIn('B101', scan_report)
             inventory = root / 'inventory.json'
-            inventory.write_text(json.dumps([{'repo': 'a/b', 'version': 'v1'}]))
+            inventory.write_text(json.dumps([{'repo': 'a/b', 'version': 'v1', 'osv_resolve': False}]))
             artifact = root / 'artifacts' / 'scan-0'
             artifact.mkdir(parents=True)
             for name in ('revision.json', 'results.json', 'status.json', 'diagnostics.json', 'specialized.json', 'semgrep.json'):
@@ -55,6 +58,8 @@ class ReportPipelineTests(unittest.TestCase):
             catalog.write_text(json.dumps({'dateReleased': '2026-11-15', 'vulnerabilities': [{'cveID': 'CVE-2026-1000', 'dateAdded': '2026-01-01'}]}))
             cli('aggregate', inventory, root / 'artifacts', '--cisa-catalog', catalog, extra={'GITHUB_STEP_SUMMARY': str(summary)})
             combined = (root / 'combined-report.md').read_text()
+            self.assertEqual(summary.read_text(), combined)
+            self.assertIn('OSV transitive resolution disabled', combined)
             for expected in ('0 critical and 2 high', '1 unrated OSV entries', 'image not configured', '1 repository/CVE match(es)', 'OSV-Scanner, Trivy', '1 Semgrep ERROR results'):
                 self.assertIn(expected, combined)
             self.assertNotIn('redaction-sentinel', combined)

@@ -31,6 +31,7 @@ class SpecializedTests(unittest.TestCase):
             (root / 'Dockerfile').write_text('FROM example:1')
             def fake_run(args, **kwargs):
                 if args[0] == 'osv-scanner':
+                    self.assertNotIn('--no-resolve', args)
                     data = {'results': [{'source': {'path': 'requirements.txt'}, 'packages': [{'package': {'name': 'example', 'version': '1'}, 'vulnerabilities': [{'id': 'CVE-TEST', 'summary': 'Affected package'}]}]}]}
                     return subprocess.CompletedProcess(args, 1, json.dumps(data), '')
                 if args[0] == 'bandit':

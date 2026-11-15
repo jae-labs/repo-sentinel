@@ -30,6 +30,13 @@ class InventoryTests(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 parse_inventory([{'repo': 'a/b', 'version': 'v1', **extra}])
 
+    def test_osv_resolution_defaults_on_and_accepts_boolean_override(self):
+        target = {'repo': 'a/b', 'version': 'v1'}
+        self.assertTrue(parse_inventory([target])[0].osv_resolve)
+        self.assertFalse(parse_inventory([dict(target, osv_resolve=False)])[0].osv_resolve)
+        with self.assertRaises(ValueError):
+            parse_inventory([dict(target, osv_resolve='false')])
+
     def test_empty_inventory_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -37,7 +44,10 @@ class InventoryTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_OUTPUT=str(root / 'output'), GITHUB_STEP_SUMMARY=str(root / 'summary'))
             subprocess.run([sys.executable, '-m', 'sentinel', 'inventory', str(root / 'inventory.json')], env=env, check=True)
             self.assertIn('has_targets=false', (root / 'output').read_text())
-            self.assertIn('No scan targets', (root / 'summary').read_text())
+            self.assertFalse((root / 'summary').exists())
+            env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1])
+            subprocess.run([sys.executable, '-m', 'sentinel', 'aggregate', 'inventory.json', 'artifacts'], cwd=root, env=env, check=True)
+            self.assertIn('No targets configured', (root / 'summary').read_text())
 
 
 class RevisionTests(unittest.TestCase):
