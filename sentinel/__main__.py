@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from sentinel.specialized import scan as specialized_scan
+from sentinel.sarif import sanitize_file
 from sentinel.extra_scanners import normalize_file, render_extra
 from sentinel.aggregate import combined_report, summary_excerpt
 from sentinel.scanner import clone_target, diagnostics_summary, parse_inventory, render_summary, scan_diagnostics
@@ -27,6 +28,9 @@ def main() -> int:
     normalize.add_argument('scanner', choices=['semgrep'])
     normalize.add_argument('source', type=Path)
     normalize.add_argument('destination', type=Path)
+    sarif = sub.add_parser('sanitize-sarif')
+    sarif.add_argument('source', type=Path)
+    sarif.add_argument('destination', type=Path)
     aggregate = sub.add_parser('aggregate')
     aggregate.add_argument('inventory', type=Path)
     aggregate.add_argument('artifacts', type=Path)
@@ -47,6 +51,8 @@ def main() -> int:
             print('::warning::One or more specialized scans did not complete; see summary.')
     elif args.command == 'normalize':
         normalize_file(args.scanner, args.source, args.destination)
+    elif args.command == 'sanitize-sarif':
+        sanitize_file(args.source, args.destination)
     elif args.command == 'clone':
         target = parse_inventory([{'repo': os.environ['TARGET_REPO'], 'version': os.environ['TARGET_VERSION']}])[0]
         revision = clone_target(target, Path('target'))
@@ -82,6 +88,9 @@ def main() -> int:
                     out.write('\n**Image scan diagnostics are incomplete or contain errors.**\n')
             else:
                 out.write('\n### Container image\n\nNot scanned: no image configured.\n')
+            sarif_names = ('results.sarif', 'image-results.sarif', 'semgrep.sarif', 'osv.sarif', 'bandit.sarif')
+            available = [name for name in sarif_names if Path(name).is_file()]
+            out.write('\n### Sanitized SARIF artifacts\n\n' + (', '.join(available) if available else 'None available') + '. Missing artifacts may mean a scan was not applicable or SARIF generation failed; check job warnings.\n')
             for name in ('semgrep', 'specialized'):
                 path = Path(name + '.json')
                 report_extra = json.loads(path.read_text(encoding='utf-8')) if path.exists() else None

@@ -55,6 +55,28 @@ def timed_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str
     finally:
         print(f"{args[0]} elapsed: {time.monotonic() - start:.1f}s", flush=True)
 
+
+def fixed_versions(vulnerability: dict[str, Any], package: dict[str, Any]) -> list[str]:
+    """Return matching ecosystem version fixes only; never infer from Git ranges."""
+    ecosystem = str(package.get('ecosystem') or '').casefold()
+    name = str(package.get('name') or '').casefold()
+    if not ecosystem or not name:
+        return []
+    versions: set[str] = set()
+    for affected in vulnerability.get('affected') or []:
+        if not isinstance(affected, dict):
+            continue
+        candidate = affected.get('package') or {}
+        if not isinstance(candidate, dict) or str(candidate.get('ecosystem') or '').casefold() != ecosystem or str(candidate.get('name') or '').casefold() != name:
+            continue
+        for interval in affected.get('ranges') or []:
+            if not isinstance(interval, dict) or interval.get('type') not in ('ECOSYSTEM', 'SEMVER'):
+                continue
+            for event in interval.get('events') or []:
+                if isinstance(event, dict) and isinstance(event.get('fixed'), str):
+                    versions.add(event['fixed'])
+    return sorted(versions)
+
 def scan(root: Path) -> dict[str, Any]:
     files = detect(root)
     findings: list[dict[str, Any]] = []
@@ -79,7 +101,7 @@ def scan(root: Path) -> dict[str, Any]:
                 for package in group.get('packages', []):
                     pkg = package.get('package') or {}
                     for vuln in package.get('vulnerabilities', []):
-                        findings.append({'scanner': 'OSV-Scanner', 'rule': str(vuln.get('id') or 'unknown'), 'path': source, 'line': None, 'severity': 'advisory', 'description': str(pkg.get('name') or 'unknown') + '@' + str(pkg.get('version') or 'unknown') + ': ' + str(vuln.get('summary') or 'Known dependency vulnerability'), 'package': str(pkg.get('name') or 'unknown'), 'version': str(pkg.get('version') or 'unknown'), 'aliases': [str(a) for a in vuln.get('aliases', []) if isinstance(a, str)], 'url': 'https://osv.dev/vulnerability/' + str(vuln.get('id') or ''), 'fixed': sorted({str(event['fixed']) for affected in (vuln.get('affected') or []) for interval in (affected.get('ranges') or []) for event in (interval.get('events') or []) if event.get('fixed')})})
+                        findings.append({'scanner': 'OSV-Scanner', 'rule': str(vuln.get('id') or 'unknown'), 'path': source, 'line': None, 'severity': 'advisory', 'description': str(pkg.get('name') or 'unknown') + '@' + str(pkg.get('version') or 'unknown') + ': ' + str(vuln.get('summary') or 'Known dependency vulnerability'), 'package': str(pkg.get('name') or 'unknown'), 'version': str(pkg.get('version') or 'unknown'), 'aliases': [str(a) for a in vuln.get('aliases', []) if isinstance(a, str)], 'url': 'https://osv.dev/vulnerability/' + str(vuln.get('id') or ''), 'fixed': fixed_versions(vuln, pkg)})
             warnings = sum(1 for line in result.stderr.splitlines() if any(word in line.lower() for word in ('warning', 'warn ', 'error', 'failed', 'unable to')))
             detail = 'No packages found.' if result.returncode == 128 else 'Dependency advisories checked.'
             if warnings:
@@ -102,7 +124,7 @@ def scan(root: Path) -> dict[str, Any]:
         for offset in range(0, len(python_files), 100):
             batch = python_files[offset:offset + 100]
             try:
-                result = timed_run(['bandit', '-f', 'json', '--exit-zero', '--ignore-nosec', *(str(path) for path in batch)])
+                result = timed_run(['bandit', '--quiet', '-f', 'json', '--exit-zero', '--ignore-nosec', *(str(path) for path in batch)])
                 if result.returncode != 0:
                     raise ValueError(f'exit {result.returncode}; {diagnostic_category(result.stderr)}')
                 data = json.loads(result.stdout)

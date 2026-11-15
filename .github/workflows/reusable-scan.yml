@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          trivy fs --timeout 20m --scanners vuln,misconfig --severity HIGH,CRITICAL --format json --output results.json --exit-code 0 --no-progress target 2>scan.log
+          trivy fs --timeout 20m --skip-files '**/*.dockerignore' --scanners vuln,misconfig --severity HIGH,CRITICAL --format json --output results.json --exit-code 0 --no-progress target 2>scan.log
           scan_exit=$?
           cat scan.log
           exit "$scan_exit"
@@ -81,12 +81,16 @@ jobs:
           set -euo pipefail
           raw="$RUNNER_TEMP/semgrep-raw.json"
           log="$RUNNER_TEMP/semgrep.log"
-          trap 'rm -f "$raw" "$log"' EXIT
-          if ! timeout 20m semgrep scan --config p/security-audit --disable-nosem --metrics=off --disable-version-check --no-git-ignore --json --output "$raw" target 2>"$log"; then
+          sarif="$RUNNER_TEMP/semgrep-raw.sarif"
+          trap 'rm -f "$raw" "$log" "$sarif"' EXIT
+          if ! timeout 20m semgrep scan --config p/security-audit --disable-nosem --metrics=off --disable-version-check --no-git-ignore --json --output "$raw" --sarif-output "$sarif" target 2>"$log"; then
             echo 'Semgrep failed; scanner output withheld because it may contain source text.' >&2
             exit 1
           fi
           python3 -m sentinel normalize semgrep "$raw" semgrep.json
+          if ! python3 -m sentinel sanitize-sarif "$sarif" semgrep.sarif; then
+            echo '::warning::Semgrep SARIF unavailable or invalid.'
+          fi
       - name: Install OSV-Scanner
         if: ${{ always() && steps.clone.outcome == 'success' }}
         shell: bash
@@ -98,7 +102,7 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Install Bandit
         if: ${{ always() && steps.clone.outcome == 'success' }}
-        run: python3 -m pip install 'bandit==1.9.4'
+        run: python3 -m pip install 'bandit[sarif]==1.9.4'
       - name: Install Hadolint
         if: ${{ always() && steps.clone.outcome == 'success' }}
         shell: bash
@@ -113,6 +117,48 @@ jobs:
         id: specialized
         if: ${{ always() && steps.clone.outcome == 'success' }}
         run: python3 -m sentinel specialized target
+      - name: Generate sanitized SARIF artifacts
+        if: ${{ always() && steps.clone.outcome == 'success' }}
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -u
+          raw="$RUNNER_TEMP/native-results.sarif"
+          config="$RUNNER_TEMP/osv-empty.toml"
+          trap 'rm -f "$raw" "$config"' EXIT
+          for report in results image-results; do
+            if [[ -s "$report.json" ]]; then
+              rm -f "$raw"
+              if trivy convert --format sarif --output "$raw" "$report.json" && python3 -m sentinel sanitize-sarif "$raw" "$report.sarif"; then
+                :
+              else
+                echo "::warning::SARIF conversion failed for $report."
+              fi
+            fi
+          done
+          rm -f "$raw"
+          : > "$config"
+          if command -v osv-scanner >/dev/null; then
+            env CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org timeout 20m osv-scanner scan source -r --no-ignore --config "$config" --format sarif target > "$raw" 2>/dev/null
+            code=$?
+            if [[ "$code" == 0 || "$code" == 1 ]]; then
+              python3 -m sentinel sanitize-sarif "$raw" osv.sarif || echo '::warning::OSV SARIF unavailable or invalid.'
+            elif [[ "$code" != 128 ]]; then
+              echo '::warning::OSV SARIF scan failed or timed out.'
+            fi
+          else
+            echo '::warning::OSV SARIF scanner unavailable.'
+          fi
+          rm -f "$raw"
+          if command -v bandit >/dev/null; then
+            if timeout 20m bandit -r target --quiet --format sarif --output "$raw" --exit-zero --ignore-nosec >/dev/null 2>&1; then
+              python3 -m sentinel sanitize-sarif "$raw" bandit.sarif || echo '::warning::Bandit SARIF unavailable or invalid.'
+            else
+              echo '::warning::Bandit SARIF scan failed or timed out.'
+            fi
+          else
+            echo '::warning::Bandit SARIF scanner unavailable.'
+          fi
       - name: Summarize findings
         if: always()
         env:
@@ -141,6 +187,11 @@ jobs:
             specialized.json
             image-results.json
             image-scan.log
+            results.sarif
+            image-results.sarif
+            semgrep.sarif
+            osv.sarif
+            bandit.sarif
           if-no-files-found: warn
           retention-days: 30
   summary:

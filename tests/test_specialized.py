@@ -1,11 +1,12 @@
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sentinel.specialized import detect, scan
+from sentinel.specialized import detect, fixed_versions, scan
 
 
 class SpecializedTests(unittest.TestCase):
@@ -60,6 +61,27 @@ class SpecializedTests(unittest.TestCase):
             self.assertIn('exit -9', result['coverage'][1]['detail'])
             self.assertNotIn('sensitive diagnostic', str(result))
             self.assertEqual(len(result['findings']), 1)
+
+    def test_fixed_versions_match_package_and_ecosystem(self):
+        vuln = {'affected': [
+            {'package': {'name': 'pillow', 'ecosystem': 'PyPI'}, 'ranges': [{'type': 'ECOSYSTEM', 'events': [{'fixed': '10.0.1'}]}, {'type': 'GIT', 'events': [{'fixed': 'abcdef123'}]}]},
+            {'package': {'name': 'pillow', 'ecosystem': 'Go'}, 'ranges': [{'type': 'SEMVER', 'events': [{'fixed': '99.0'}]}]},
+        ]}
+        self.assertEqual(fixed_versions(vuln, {'name': 'pillow', 'ecosystem': 'PyPI'}), ['10.0.1'])
+        self.assertEqual(fixed_versions(vuln, {'name': 'pillow'}), [])
+
+    @unittest.skipUnless(shutil.which('bandit'), 'Bandit CLI not installed')
+    def test_real_bandit_large_batch_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(101):
+                (root / f'file{i:03}.py').write_text('assert True\n')
+            bandit_path = shutil.which('bandit')
+            with patch('sentinel.specialized.shutil.which', side_effect=lambda name: bandit_path if name == 'bandit' else None):
+                result = scan(root)
+            bandit = next(row for row in result['coverage'] if row['scanner'] == 'Bandit')
+            self.assertEqual(bandit['status'], 'completed')
+            self.assertTrue(any(row['rule'] == 'B101' for row in result['findings']))
 
     def test_empty_target_is_not_a_clean_scan(self):
         with tempfile.TemporaryDirectory() as tmp:

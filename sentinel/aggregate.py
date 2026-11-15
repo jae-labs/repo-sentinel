@@ -66,7 +66,8 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
             elif diagnostics.get('dependency_files') is None:
                 match += '; dependency coverage unknown'
             overview.append(f'| {cell(target.repo)} | {cell(target.version)} | {match} | {c} | {h} |')
-            extra_sections = []
+            sarif_files = [name for name in ('results.sarif', 'image-results.sarif', 'semgrep.sarif', 'osv.sarif', 'bandit.sarif') if (directory / name).is_file()]
+            extra_sections = ['### Sanitized SARIF artifacts\n\n' + (', '.join(sarif_files) if sarif_files else 'None available') + '. Missing files may indicate unavailable or inapplicable scans; see job warnings.\n']
             for name in ('semgrep', 'specialized'):
                 outcome = status.get(name + '_outcome', 'missing')
                 valid_extra = True
