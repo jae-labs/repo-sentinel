@@ -1,17 +1,18 @@
-"""Summarize scan evidence and coverage across every target."""
+"""Aggregate findings and scanner coverage."""
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from sentinel.extra_scanners import dependency_scope, grouped_findings
-from sentinel.kev import kev_section
+from sentinel.extra_scanners import dependency_scope
+from sentinel.kev import finding_cves, kev_section
 from sentinel.scanner import Target, cell, findings, priority_severity, scan_diagnostics, short_description
 
-PRIORITY_LIMIT = 30
+PRIORITY_LIMIT_PER_SEVERITY = 8
+EVIDENCE_ORDER = {'Image': 0, 'Source': 1, 'Dev/test': 2}
 SARIF_FILES = ('results.sarif', 'image-results.sarif', 'semgrep.sarif', 'osv.sarif', 'bandit.sarif')
 
 
@@ -36,32 +37,57 @@ def trivy_findings(directory: Path, filename: str) -> list[dict[str, str]]:
     return findings(report)
 
 
+def group_priorities(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Group advisories by repository and evidence, and rules by file."""
+    groups: dict[tuple[str, ...], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        evidence = 'Image' if row['scanner'] == 'Trivy image' else 'Source'
+        if evidence == 'Source' and dependency_scope(row['target']) == 'development/test':
+            evidence = 'Dev/test'
+        if row['kind'] == 'advisory':
+            key = row['repo'], evidence, 'advisory', row.get('advisory_key', row['id']).upper()
+        else:
+            key = row['repo'], evidence, 'rule', row['scanner'], row['id'], row['target']
+        groups[key].append(row)
+
+    grouped = []
+    for key, matches in groups.items():
+        representative = min(matches, key=lambda row: (row['severity'] != 'CRITICAL', row['fixed'] == '—'))
+        variants = {(row['package'], row['installed'], row['fixed']) for row in matches}
+        package = representative['package']
+        if len(variants) > 1:
+            package += f' (+{len(variants) - 1})'
+        grouped.append(dict(representative, evidence=key[1], package=package))
+    return grouped
+
+
 def priority_table(rows: list[dict[str, str]]) -> str:
     if not rows:
-        return '## High and critical findings\n\nNo high or critical results reported by the available scanners. See coverage below.\n\n'
+        return '## Critical and high findings\n\nNo critical or high findings reported.\n\n'
     ordered = sorted(rows, key=lambda row: (
-        row['severity'] != 'CRITICAL', dependency_scope(row['target']) == 'development/test',
-        row['repo'], row['scanner'], row['id'], row['package'],
+        row['severity'] != 'CRITICAL', EVIDENCE_ORDER[row['evidence']],
+        row['repo'], row['id'], row['package'],
     ))
     selected: list[dict[str, str]] = []
     per_target: Counter[tuple[str, str]] = Counter()
+    per_severity: Counter[str] = Counter()
     for row in ordered:
-        key = row['repo'], row['severity']
-        if per_target[key] < 3:
+        severity = row['severity']
+        key = row['repo'], severity
+        if per_target[key] < 2 and per_severity[severity] < PRIORITY_LIMIT_PER_SEVERITY:
             selected.append(row)
             per_target[key] += 1
-        if len(selected) == PRIORITY_LIMIT:
-            break
-    lines = ['## High and critical findings', '',
-             f'Showing {len(selected)} of {len(rows)} reported rows, up to three per repository and severity. Open the individual scan artifact for full findings.',
-             '', '| Severity | Repository | Scanner | Advisory | Finding | Package or file | Version → fix |',
+            per_severity[severity] += 1
+    lines = ['## Critical and high findings', '',
+             f'Showing {len(selected)} of {len(rows)} grouped findings. See scan artifacts for details.',
+             '', '| Severity | Repository | Evidence | Advisory or rule | Finding | Package or file | Version → fix |',
              '| --- | --- | --- | --- | --- | --- | --- |']
     for row in selected:
         advisory = cell(row['id'])
         url = row.get('url', '')
         if url.startswith('https://') and not any(c.isspace() for c in url):
             advisory = f'[{advisory}]({quote(url, safe=":/#?&=%._~-+;")})'
-        fields = (row['severity'], row['repo'], row['scanner'])
+        fields = (row['severity'], row['repo'], row['evidence'])
         location = cell(short_description(row['package'], 100))
         version = cell(short_description(row['installed'] + ' → ' + row['fixed'], 120))
         lines.append('| ' + ' | '.join([*(cell(c) for c in fields), advisory,
@@ -84,7 +110,9 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
         revision_valid = (identity and status.get('clone_outcome') == 'success'
                           and revision.get('repository') == target.repo
                           and revision.get('requested_version') == target.version
-                          and bool(revision.get('commit')) and isinstance(revision.get('matched_version'), bool))
+                          and bool(revision.get('commit')) and isinstance(revision.get('matched_version'), bool)
+                          and (not target.source_commit
+                               or (revision['matched_version'] and revision['commit'] == target.source_commit)))
         gaps: list[str] = []
         notes: list[str] = []
         source_count = image_count = other_count = '—'
@@ -111,9 +139,7 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
         else:
             gaps.append('Trivy source unavailable')
 
-        if not target.image:
-            notes.append('image not configured')
-        elif (identity and status.get('image') == target.image and status.get('platform') == target.platform
+        if (target.image and identity and status.get('image') == target.image and status.get('platform') == target.platform
               and status.get('image_outcome') == 'success'):
             try:
                 rows = trivy_findings(directory, 'image-results.json')
@@ -126,10 +152,10 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
                 gaps.append('Trivy image report or diagnostics unavailable')
             if '@sha256:' not in target.image:
                 notes.append('mutable image tag')
-        else:
+        elif target.image:
             gaps.append('Trivy image unavailable')
 
-        semgrep = available_report(directory / 'semgrep.json') if identity else {}
+        semgrep = available_report(directory / 'semgrep.json') if identity and (not target.source_commit or revision_valid) else {}
         if status.get('semgrep_outcome') != 'success' or semgrep.get('scanner') != 'semgrep' or not isinstance(semgrep.get('findings'), list):
             gaps.append('Semgrep unavailable')
         else:
@@ -141,7 +167,7 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
             if errors:
                 notes.append(f'{errors} Semgrep ERROR results')
 
-        specialized = available_report(directory / 'specialized.json') if identity else {}
+        specialized = available_report(directory / 'specialized.json') if identity and (not target.source_commit or revision_valid) else {}
         if (status.get('specialized_outcome') != 'success' or specialized.get('scanner') != 'specialized'
                 or not isinstance(specialized.get('findings'), list)):
             gaps.append('specialized scans unavailable')
@@ -158,15 +184,20 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
             unrated = sum(row.get('scanner') == 'OSV-Scanner' and str(row.get('severity', '')).upper() in {'ADVISORY', 'UNRATED', ''} for row in rows)
             if unrated:
                 notes.append(f'{unrated} unrated OSV entries')
-            selected = grouped_findings([row for row in rows if priority_severity(row.get('severity'))])
+            selected = [row for row in rows if priority_severity(row.get('severity'))]
             other_count = str(len(selected))
             for row in selected:
                 path = str(row.get('path') or '—')
                 fixed = row.get('fixed') or []
+                rule = str(row.get('rule') or 'unknown')
+                aliases = row.get('aliases')
+                cves = finding_cves([rule, *(aliases if isinstance(aliases, list) else [])])
                 priority.append({
                     'repo': target.repo, 'scanner': str(row.get('scanner', 'specialized')),
-                    'severity': priority_severity(row.get('severity')), 'id': str(row.get('rule', 'unknown')),
-                    'title': str(row.get('description') or 'See rule identifier'),
+                    'severity': priority_severity(row.get('severity')), 'id': rule,
+                    'kind': 'advisory' if row.get('scanner') == 'OSV-Scanner' else 'rule',
+                    'advisory_key': next(iter(cves)) if len(cves) == 1 else rule,
+                    'title': str(row.get('description') or 'See advisory or rule'),
                     'package': str(row.get('package') or path), 'target': path,
                     'installed': str(row.get('version') or '—'), 'fixed': ', '.join(fixed) or '—',
                     'url': str(row.get('url') or ''),
@@ -191,23 +222,23 @@ def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path |
         coverage = '**' + cell(', '.join(gaps)) + '**' if gaps else 'Scans reported'
         if notes:
             coverage += ' · ' + cell(', '.join(notes))
-        sarif = ', '.join(name.removesuffix('.sarif') for name in SARIF_FILES if (directory / name).is_file())
-        overview.append(f'| {cell(target.repo)} | {cell(target.version)} | {coverage} | {source_count} | {image_count} | {other_count} | {sarif or "—"} |')
+        artifact = f'`scan-{index}`' if directory.is_dir() else '—'
+        overview.append(f'| {cell(target.repo)} | {cell(target.version)} | {coverage} | {source_count} | {image_count} | {other_count} | {artifact} |')
 
-    heading = (f'# Combined scan report\n\n'
-               f'**{available}/{len(targets)} Trivy source reports available. '
-               f'{partial} targets have coverage gaps, including {unmatched} source version fallbacks.**\n\n')
-    if unknown_semgrep:
-        heading += f'Semgrep skipped-file counts unavailable for {unknown_semgrep} targets.\n\n'
+    priority = group_priorities(priority)
     counts = Counter(row['severity'] for row in priority)
-    heading += (f'**{counts["CRITICAL"]} critical and {counts["HIGH"]} high finding rows** across available scans. '
-                'A vulnerability can appear in more than one scanner, package, or image. '
-                'Semgrep ERROR and unrated OSV advisories use separate labels.\n\n')
-    table = ('## Repository coverage\n\n'
-             'Counts are high and critical rows. A dash means unavailable or inapplicable.\n\n'
-             '| Repository | Requested version | Coverage and notes | Source | Image | Other | SARIF |\n'
+    heading = (f'# Combined scan report\n\n'
+               f'**{counts["CRITICAL"]} critical and {counts["HIGH"]} high grouped findings**\n\n'
+               f'{available}/{len(targets)} Trivy source reports · {partial} targets with coverage gaps '
+               f'· default branch used for {unmatched}\n\n')
+    table = ('<details>\n<summary>Repository coverage</summary>\n\n'
+             'Counts show critical and high scanner records. A dash indicates no report.\n\n')
+    if unknown_semgrep:
+        table += f'Semgrep skip counts unavailable for {unknown_semgrep} targets.\n\n'
+    table += (
+             '| Repository | Version | Coverage | Source | Image | Other | Artifact |\n'
              '| --- | --- | --- | ---: | ---: | ---: | --- |\n')
-    return heading + kev_section(targets, artifacts, catalog_path) + priority_table(priority) + table + '\n'.join(overview) + '\n'
+    return heading + kev_section(targets, artifacts, catalog_path) + priority_table(priority) + table + '\n'.join(overview) + '\n\n</details>\n'
 
 
 def summary_excerpt(report: str, byte_limit: int = 900_000) -> str:

@@ -22,6 +22,7 @@ class Target:
     image: str = ''
     platform: str = ''
     osv_resolve: bool = True
+    source_commit: str = ''
 
 
 def parse_inventory(value: Any) -> list[Target]:
@@ -51,8 +52,11 @@ def parse_inventory(value: Any) -> list[Target]:
         osv_resolve = item.get('osv_resolve', True)
         if not isinstance(osv_resolve, bool):
             raise ValueError('osv_resolve must be a boolean')
+        source_commit = item.get('source_commit', '')
+        if not isinstance(source_commit, str) or (source_commit and not re.fullmatch(r'[0-9a-fA-F]{40}', source_commit)):
+            raise ValueError('source_commit must be a full Git commit SHA')
         seen.add(repo.lower())
-        targets.append(Target(repo, version, image, platform, osv_resolve))
+        targets.append(Target(repo, version, image, platform, osv_resolve, source_commit.lower()))
     return targets
 
 
@@ -94,10 +98,12 @@ def clone_target(target: Target, path: Path) -> dict[str, Any]:
     try:
         tag_fetch = run_git(path, 'fetch', '--tags', 'origin')
         if tag_fetch.returncode:
-            warnings.append('Some remote tags could not be fetched; version resolution may be incomplete.')
+            warnings.append('Tag fetch failed.')
     except subprocess.TimeoutExpired:
-        warnings.append('Tag fetch timed out; version resolution may be incomplete.')
-    commit, matched = resolve_revision(path, target.version)
+        warnings.append('Tag fetch timed out.')
+    commit, matched = resolve_revision(path, target.source_commit or target.version)
+    if target.source_commit and (not matched or commit != target.source_commit):
+        raise RuntimeError(f'Unable to resolve pinned source commit for {target.repo}')
     result = run_git(path, 'checkout', '--quiet', '--detach', commit)
     if result.returncode:
         raise RuntimeError(f'Checkout failed: {result.stderr.strip()}')
@@ -105,25 +111,25 @@ def clone_target(target: Target, path: Path) -> dict[str, Any]:
         try:
             submodules = run_git(path, 'submodule', 'update', '--init', '--recursive')
             if submodules.returncode:
-                warnings.append('One or more submodules could not be fetched; source coverage is incomplete.')
+                warnings.append('Submodule fetch failed.')
             else:
-                warnings.append('Submodules fetched at recorded commits; their Git LFS content is not verified.')
+                warnings.append('Submodule Git LFS coverage is unverified.')
         except subprocess.TimeoutExpired:
-            warnings.append('Submodule fetch timed out; source coverage is incomplete.')
+            warnings.append('Submodule fetch timed out.')
     try:
         lfs = run_git(path, 'lfs', 'ls-files', '--name-only')
         if lfs.returncode:
-            warnings.append('Git LFS status unavailable; LFS coverage is unknown.')
+            warnings.append('Git LFS status unavailable.')
         elif lfs.stdout.strip():
             pulled = run_git(path, 'lfs', 'pull')
             if pulled.returncode:
-                warnings.append('Git LFS objects could not be fetched; source coverage is incomplete.')
+                warnings.append('Git LFS fetch failed.')
     except subprocess.TimeoutExpired:
-        warnings.append('Git LFS operation timed out; source coverage is incomplete.')
+        warnings.append('Git LFS operation timed out.')
     for _, dirs, files in os.walk(path, followlinks=False):
         dirs[:] = [directory for directory in dirs if directory != '.git']
         if '.semgrepignore' in files:
-            warnings.append('Semgrep ignore files may exclude source files from analysis.')
+            warnings.append('Semgrep ignore files detected.')
             break
     return {'repository': target.repo, 'requested_version': target.version, 'commit': commit, 'matched_version': matched, 'source_warnings': warnings}
 
@@ -140,6 +146,7 @@ def findings(report: dict[str, Any]) -> list[dict[str, str]]:
                 output.append({
                     'severity': severity, 'id': str(item.get('VulnerabilityID') or item.get('ID') or 'unknown'),
                     'package': str(item.get('PkgName') or result.get('Target') or 'unknown'),
+                    'kind': 'advisory' if key == 'Vulnerabilities' else 'rule',
                     'installed': str(item.get('InstalledVersion') or '—'),
                     'fixed': str(item.get('FixedVersion') or '—'),
                     'url': str(item.get('PrimaryURL') or ''),
@@ -180,22 +187,22 @@ def scan_diagnostics(log: str | None) -> dict[str, Any]:
 
 def diagnostics_summary(info: dict[str, Any]) -> str:
     if not info.get('available'):
-        return '**Scan diagnostics unavailable; coverage cannot be verified.**'
+        return '**Trivy diagnostics unavailable.**'
     lines = []
     errors = info.get('errors', [])
     if errors:
-        lines.append(f'**Partial scan: {len(errors)} scanner error(s).** Some checks may not have completed; see scan.log in the artifact.')
+        lines.append(f'**Partial scan. Trivy logged {len(errors)} errors.**')
         for error in errors[:5]:
             lines.append(f'- {cell(short_description(error, 350))}')
         if len(errors) > 5:
             lines.append(f'- {len(errors) - 5} additional errors in scan.log.')
     count = info.get('dependency_files')
     if count is None:
-        lines.append('Trivy dependency files: unknown (scanner did not report a count).')
+        lines.append('Trivy dependency file count unavailable.')
     elif count == 0:
-        lines.append('**Trivy dependency files: no language-specific dependency files detected.**')
+        lines.append('Trivy detected no dependency files.')
     else:
-        lines.append(f'Trivy dependency files: {count} language-specific file(s) detected; this does not guarantee complete dependency coverage.')
+        lines.append(f'Trivy detected {count} dependency files.')
     return '\n'.join(lines)
 
 
@@ -203,12 +210,12 @@ def render_summary(repo: str, version: str, revision: dict[str, Any] | None, rep
     label = 'Platform' if image else 'Requested version'
     lines = [f'## {cell(repo)}', '', f'{label}: `{cell(version)}`']
     if revision:
-        match = 'matched requested version' if revision['matched_version'] else 'default branch; requested version not matched'
+        match = 'requested revision' if revision['matched_version'] else 'default branch fallback'
         lines.append(f"Scanned commit: `{cell(str(revision['commit']))}` ({match})")
         for warning in revision.get('source_warnings', []):
             lines.append('**Source coverage:** ' + cell(str(warning)))
     if status != 'success' or report is None:
-        lines.append('**Scan failed or did not produce a report. Check the job logs.**')
+        lines.append('**Scan failed or produced no report.** See job logs.')
         return '\n\n'.join(lines) + '\n'
     rows = findings(report)
     scan = 'image scan' if image else 'source scan'
@@ -222,5 +229,5 @@ def render_summary(repo: str, version: str, revision: dict[str, Any] | None, rep
                 ident = f'[{ident}]({quote(url, safe=":/#?&=%._~-+;")})'
             lines.append(f"| {cell(item['severity'])} | {ident} | {cell(short_description(item['title']))} | {cell(item['package'])} | {cell(item['installed'])} | {cell(item['fixed'])} |")
         if len(rows) > limit:
-            lines.append(f'\nShowing {limit} of {len(rows)} findings; see the JSON artifact for the full report.')
+            lines.append(f'\nShowing {limit} of {len(rows)} findings. See the JSON report for all results.')
     return '\n'.join(lines) + '\n'

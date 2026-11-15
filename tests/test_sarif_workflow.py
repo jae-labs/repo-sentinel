@@ -10,7 +10,7 @@ class SarifWorkflowTests(unittest.TestCase):
     def test_exports_available_findings_without_rerunning_scanners(self):
         repo = Path(__file__).resolve().parents[1]
         workflow = (repo / '.github/workflows/reusable-scan.yml').read_text()
-        step = workflow.split('      - name: Generate sanitized SARIF artifacts\n', 1)[1].split('      - name: Summarize findings\n', 1)[0]
+        step = workflow.split('      - name: Export sanitized SARIF\n', 1)[1].split('      - name: Write scan report\n', 1)[0]
         block = step.split('        run: |\n', 1)[1]
         script = '\n'.join(line[10:] for line in block.splitlines() if line.startswith('          ')) + '\n'
         with tempfile.TemporaryDirectory() as temp:

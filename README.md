@@ -1,11 +1,17 @@
 # Repo Sentinel
 
-Repo Sentinel scans public third-party repositories for dependency vulnerabilities, insecure configuration, and source-code issues. It runs on a schedule or on demand using GitHub Actions and produces a combined report plus individual scan artifacts, including sanitized SARIF.
+Repo Sentinel scans public GitHub repositories and container images for dependency vulnerabilities, insecure configuration, and source-code issues. It uses Trivy, OSV-Scanner, Semgrep, Bandit, and Hadolint.
 
-Add targets to an inventory under `inventories/` using GitHub `owner/repository` names and version tags or commits. Optionally set `image` and `platform` (for example `linux/arm64`) to scan a published image; an immutable digest is preferred. Workflows call the shared scanner with an inventory. If a requested revision cannot be resolved, the report identifies the default-branch fallback.
+The active scan runs daily, on pushes to `main`, and on demand. Use **Generic repository scan** to run [`inventories/generic.json`](inventories/generic.json) on demand.
 
-Trivy and OSV-Scanner check dependencies; Semgrep and Bandit check source code; Trivy and Hadolint check configuration and Dockerfiles. Checks run when relevant files are detected. The combined report highlights CISA known-exploited findings, groups matching advisory aliases, labels recognizable development and test paths, and shows scanner coverage limits. Unclassified dependencies may be used at runtime. Source snippets and raw Semgrep messages are excluded from saved reports; findings still require review. Go dependency analysis loads source and may download modules; project install and build scripts are not run. Image scans inspect configured registry images, not running containers.
+Targets require `repo` (`owner/repository`) and `version` (a tag or commit).
 
-The Actions run page shows a single combined summary with CISA matches, high and critical findings, and scan coverage. Download each scan artifact for its Markdown report, JSON results, and any sanitized SARIF. OSV has a five-minute limit per repository. For a target whose manifests repeatedly fail dependency resolution, set `"osv_resolve": false` to scan without resolving transitive dependencies. The report flags that limit.
+- `source_commit` pins a full commit SHA when the component version has no matching repository tag.
+- `image` and `platform` select a published container image and architecture.
+- `osv_resolve: false` skips transitive resolution for that target.
+
+Unresolved versions fall back to the default branch. An unavailable `source_commit` fails the source checkout.
+
+Each run publishes one summary with CISA KEV matches, grouped critical and high findings, and coverage gaps. Per-target Markdown, JSON, and SARIF artifacts are retained for 30 days.
 
 Run tests with `python3 -m unittest discover -s tests -v`.

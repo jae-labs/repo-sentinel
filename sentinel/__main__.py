@@ -1,4 +1,4 @@
-"""Command-line interface used by GitHub Actions."""
+"""GitHub Actions CLI."""
 from __future__ import annotations
 
 import argparse
@@ -47,7 +47,7 @@ def main() -> int:
         result = specialized_scan(args.path, resolve_osv=os.environ.get('OSV_RESOLVE') != 'false')
         Path('specialized.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
         if any(entry['status'] in ('incomplete', 'partial') for entry in result['coverage']):
-            print('::warning::One or more specialized scans did not complete; see summary.')
+            print('::warning::Incomplete scanner coverage. See the scan report.')
     elif args.command == 'normalize':
         normalize_file(args.scanner, args.source, args.destination)
     elif args.command == 'sanitize-sarif':
@@ -55,13 +55,17 @@ def main() -> int:
     elif args.command == 'export-specialized-sarif':
         export_specialized_sarif(json.loads(args.source.read_text(encoding='utf-8')), Path('.'))
     elif args.command == 'clone':
-        target = parse_inventory([{'repo': os.environ['TARGET_REPO'], 'version': os.environ['TARGET_VERSION']}])[0]
+        target = parse_inventory([{
+            'repo': os.environ['TARGET_REPO'],
+            'version': os.environ['TARGET_VERSION'],
+            'source_commit': os.environ.get('SOURCE_COMMIT', ''),
+        }])[0]
         revision = clone_target(target, Path('target'))
         Path('revision.json').write_text(json.dumps(revision, indent=2) + '\n', encoding='utf-8')
         if revision.get('source_warnings'):
-            print('::warning::Some source components require review; see the scan artifact.')
+            print('::warning::Source coverage warning. See the scan report.')
         if not revision['matched_version']:
-            print(f'::warning::Requested version not found for {target.repo}; scanning default branch.')
+            print(f'::warning::Requested version unavailable for {target.repo}. Scanning the default branch.')
     elif args.command == 'aggregate':
         targets = parse_inventory(json.loads(args.inventory.read_text(encoding='utf-8')))
         report = combined_report(targets, args.artifacts, args.cisa_catalog)
@@ -106,11 +110,11 @@ def main() -> int:
             else:
                 out.write('\n### Container image\n\nNot scanned: no image configured.\n')
             available = [name for name in SARIF_FILES if Path(name).is_file()]
-            out.write('\n### Sanitized SARIF artifacts\n\n' + (', '.join(available) if available else 'None available') + '. Missing artifacts may mean a scan was not applicable or SARIF generation failed; check job warnings.\n')
+            out.write('\n### SARIF\n\n' + (', '.join(available) if available else 'None available') + '\n')
             for name, scanner_report in scanner_reports.items():
                 out.write('\n' + render_extra(name.title(), os.environ[name.upper() + '_OUTCOME'], scanner_report))
         if diagnostics['errors']:
-            print('::warning::Trivy logged scanner errors; results may be incomplete. See the scan artifact.')
+            print('::warning::Trivy reported scan errors. See the scan report.')
         if os.environ['SCAN_OUTCOME'] != 'success' or report is None:
             print('::error::Scan did not complete successfully; see job logs.')
     return 0

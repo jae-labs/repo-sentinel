@@ -1,4 +1,4 @@
-"""Detect source types and run targeted security scanners without project scripts."""
+"""Detect source types and run specialized scanners."""
 from __future__ import annotations
 
 import json
@@ -92,13 +92,12 @@ def scan(root: Path, *, resolve_osv: bool = True) -> dict[str, Any]:
     files = detect(root)
     findings: list[dict[str, Any]] = []
     coverage: list[dict[str, Any]] = []
-    # OSV also performs Go call analysis by default, where Go modules are detected.
     if not shutil.which('osv-scanner'):
         coverage.append({'scanner': 'OSV-Scanner', 'status': 'incomplete', 'detail': 'Scanner unavailable.'})
     else:
         try:
             env = dict(os.environ, CGO_ENABLED='0', GOWORK='off', GOTOOLCHAIN='local', GOFLAGS='-mod=readonly', GOPROXY='https://proxy.golang.org', GOSUMDB='sum.golang.org')
-            # Do not let the target's own configuration suppress vulnerabilities.
+            # Ignore target-provided suppression rules.
             with tempfile.NamedTemporaryFile(mode='w', suffix='.toml') as config:
                 config.flush()
                 args = ['osv-scanner', 'scan', 'source', '-r', '--no-ignore', '--config', config.name, '--format', 'json']
@@ -119,11 +118,11 @@ def scan(root: Path, *, resolve_osv: bool = True) -> dict[str, Any]:
             warnings = sum(1 for line in result.stderr.splitlines() if any(word in line.lower() for word in ('warning', 'warn ', 'error', 'failed', 'unable to')))
             detail = 'No packages found.' if result.returncode == 128 else 'Dependency advisories checked.'
             if not resolve_osv:
-                detail += ' OSV transitive resolution disabled. Results use dependency versions extracted from source files.'
+                detail += ' OSV transitive resolution disabled.'
             if warnings:
-                detail += f' Scanner reported {warnings} warning/error line(s); category: {diagnostic_category(result.stderr)}; some checks may be incomplete.'
+                detail += f' {warnings} diagnostic lines ({diagnostic_category(result.stderr)}).'
             if files['go']:
-                detail += ' Go call analysis is attempted; review scanner output for unsupported modules and build configurations.'
+                detail += ' Go call analysis enabled.'
             coverage.append({'scanner': 'OSV-Scanner', 'status': 'partial' if warnings else ('no packages' if result.returncode == 128 else 'completed'), 'detail': detail, 'transitive_resolution': resolve_osv})
         except subprocess.TimeoutExpired:
             coverage.append({'scanner': 'OSV-Scanner', 'status': 'incomplete', 'detail': f'Dependency scan timed out after {OSV_TIMEOUT_SECONDS // 60} minutes.'})
@@ -138,7 +137,7 @@ def scan(root: Path, *, resolve_osv: bool = True) -> dict[str, Any]:
         reasons: list[str] = []
         successful_batches = 0
         python_files = files['python']
-        # Bound memory and command size; preserve findings from successful batches.
+        # Batch files to bound memory and command size.
         for offset in range(0, len(python_files), 100):
             batch = python_files[offset:offset + 100]
             try:

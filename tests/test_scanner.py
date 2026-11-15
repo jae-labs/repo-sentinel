@@ -37,6 +37,12 @@ class InventoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_inventory([dict(target, osv_resolve='false')])
 
+    def test_source_commit_requires_full_sha(self):
+        target = {'repo': 'a/b', 'version': 'v1'}
+        self.assertEqual(parse_inventory([dict(target, source_commit='A' * 40)])[0].source_commit, 'a' * 40)
+        with self.assertRaises(ValueError):
+            parse_inventory([dict(target, source_commit='a' * 7)])
+
     def test_empty_inventory_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -83,8 +89,23 @@ class RevisionTests(unittest.TestCase):
                 return 'abc', True
             with patch('sentinel.scanner.run_git', side_effect=fake_git), patch('sentinel.scanner.resolve_revision', side_effect=fake_resolve):
                 revision = clone_target(Target('owner/repo', 'v1'), path)
-            self.assertTrue(any('submodules' in x for x in revision['source_warnings']))
+            self.assertTrue(any('Submodule' in x for x in revision['source_warnings']))
             self.assertTrue(any('LFS' in x for x in revision['source_warnings']))
+
+    def test_source_pin_preserves_version_and_rejects_fallback(self):
+        source_commit = 'a' * 40
+        target = Target('owner/repo', 'v1', source_commit=source_commit)
+        with tempfile.TemporaryDirectory() as tmp, patch('sentinel.scanner.run_git') as git, patch('sentinel.scanner.resolve_revision') as resolve:
+            git.return_value = subprocess.CompletedProcess([], 0, '', '')
+            path = Path(tmp)
+            resolve.return_value = (source_commit, True)
+            revision = clone_target(target, path)
+            resolve.assert_called_once_with(path, source_commit)
+            self.assertEqual(revision['requested_version'], 'v1')
+            self.assertEqual(revision['commit'], source_commit)
+            resolve.return_value = ('b' * 40, False)
+            with self.assertRaisesRegex(RuntimeError, 'Unable to resolve pinned source commit'):
+                clone_target(target, path)
 
 
 class ReportTests(unittest.TestCase):
@@ -100,7 +121,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn('a&#124;b', summary)
         self.assertIn('Request smuggling &#124; issue', summary)
         self.assertIn('Container runs as root', summary)
-        self.assertIn('requested version not matched', summary)
+        self.assertIn('default branch fallback', summary)
         self.assertIn('[CVE-1](https://example.org/CVE-1)', summary)
         self.assertIn('Showing 1 of 2', render_summary('o/r', 'v', None, report, 'success', limit=1))
 
@@ -110,8 +131,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result['dependency_files'], 0)
         self.assertEqual(len(result['errors']), 1)
         self.assertIn('Partial scan', diagnostics_summary(result))
-        self.assertIn('no language-specific dependency files detected', diagnostics_summary(result))
-        self.assertIn('unknown', diagnostics_summary(scan_diagnostics('INFO scan started')))
+        self.assertIn('no dependency files', diagnostics_summary(result))
+        self.assertIn('file count unavailable', diagnostics_summary(scan_diagnostics('INFO scan started')))
         self.assertIn('unavailable', diagnostics_summary(scan_diagnostics(None)))
 
     def test_scan_failure_not_clean(self):

@@ -60,7 +60,7 @@ class ReportPipelineTests(unittest.TestCase):
             combined = (root / 'combined-report.md').read_text()
             self.assertEqual(summary.read_text(), combined)
             self.assertIn('OSV transitive resolution disabled', combined)
-            for expected in ('0 critical and 2 high', '1 unrated OSV entries', 'image not configured', '1 repository/CVE match(es)', 'OSV-Scanner, Trivy', '1 Semgrep ERROR results'):
+            for expected in ('0 critical and 2 high', '1 unrated OSV entries', 'Repository/CVE matches: 1', '1 Semgrep ERROR results', '`scan-0`'):
                 self.assertIn(expected, combined)
             self.assertNotIn('redaction-sentinel', combined)
             self.assertNotIn('B101', combined)

@@ -36,12 +36,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Clone and resolve requested version
+      - name: Resolve source revision
         timeout-minutes: 15
         id: clone
         env:
           TARGET_REPO: ${{ matrix.target.repo }}
           TARGET_VERSION: ${{ matrix.target.version }}
+          SOURCE_COMMIT: ${{ matrix.target.source_commit }}
         run: python3 -m sentinel clone
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
@@ -112,14 +113,14 @@ jobs:
           echo 'c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507  '"$RUNNER_TEMP/hadolint" | sha256sum --check
           chmod +x "$RUNNER_TEMP/hadolint"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      - name: Scan detected languages and Dockerfiles
+      - name: Run specialized scanners
         timeout-minutes: 45
         id: specialized
         if: ${{ always() && steps.clone.outcome == 'success' }}
         env:
           OSV_RESOLVE: ${{ toJSON(matrix.target.osv_resolve) }}
         run: python3 -m sentinel specialized target
-      - name: Generate sanitized SARIF artifacts
+      - name: Export sanitized SARIF
         if: ${{ always() && steps.clone.outcome == 'success' }}
         timeout-minutes: 5
         shell: bash
@@ -138,7 +139,7 @@ jobs:
           if [[ -s specialized.json ]]; then
             python3 -m sentinel export-specialized-sarif specialized.json || echo '::warning::Specialized SARIF export failed.'
           fi
-      - name: Summarize findings
+      - name: Write scan report
         if: always()
         env:
           TARGET_REPO: ${{ matrix.target.repo }}
@@ -151,7 +152,7 @@ jobs:
           IMAGE_REF: ${{ matrix.target.image }}
           IMAGE_PLATFORM: ${{ matrix.target.platform }}
         run: python3 -m sentinel summary
-      - name: Save full report
+      - name: Upload scan artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -175,7 +176,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
   summary:
-    name: Combined scan summary
+    name: Combined scan
     needs: [inventory, scan]
     if: ${{ always() && needs.inventory.result == 'success' }}
     runs-on: ubuntu-latest
@@ -191,7 +192,7 @@ jobs:
           pattern: scan-*
           path: scan-artifacts
           merge-multiple: false
-      - name: Download CISA known exploited vulnerabilities catalog
+      - name: Download CISA KEV catalog
         if: needs.inventory.outputs.has_targets == 'true'
         shell: bash
         run: |
@@ -206,7 +207,7 @@ jobs:
         env:
           INVENTORY: ${{ inputs.inventory }}
         run: python3 -m sentinel aggregate "$INVENTORY" scan-artifacts --cisa-catalog cisa-kev.json
-      - name: Save combined report
+      - name: Upload combined report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: combined-report
