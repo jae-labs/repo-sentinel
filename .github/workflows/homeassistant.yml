@@ -1,0 +1,16 @@
+name: Home Assistant dependencies
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'
+      timezone: Europe/Dublin
+permissions:
+  contents: read
+concurrency:
+  group: homeassistant-scans
+  cancel-in-progress: false
+jobs:
+  scan:
+    uses: ./.github/workflows/reusable-scan.yml
+    with:
+      inventory: inventories/homeassistant.json

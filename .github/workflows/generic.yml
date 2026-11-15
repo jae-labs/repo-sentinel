@@ -1,0 +1,13 @@
+name: Generic repository scan
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: generic-scans
+  cancel-in-progress: false
+jobs:
+  scan:
+    uses: ./.github/workflows/reusable-scan.yml
+    with:
+      inventory: inventories/generic.json

@@ -1,0 +1,73 @@
+name: Reusable repository scan
+on:
+  workflow_call:
+    inputs:
+      inventory:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+      has_targets: ${{ steps.targets.outputs.has_targets }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: targets
+        env:
+          INVENTORY: ${{ inputs.inventory }}
+        run: python3 -m sentinel inventory "$INVENTORY"
+  scan:
+    needs: inventory
+    if: needs.inventory.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        target: ${{ fromJSON(needs.inventory.outputs.targets) }}
+    name: Scan ${{ matrix.target.repo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Clone and resolve requested version
+        env:
+          TARGET_REPO: ${{ matrix.target.repo }}
+          TARGET_VERSION: ${{ matrix.target.version }}
+        run: python3 -m sentinel clone
+      - name: Scan dependencies and configuration
+        id: trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.76.2
+          scan-type: fs
+          scan-ref: target
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          format: json
+          output: results.json
+          exit-code: '0'
+          cache: 'false'
+      - name: Summarize findings
+        if: always()
+        env:
+          TARGET_REPO: ${{ matrix.target.repo }}
+          TARGET_VERSION: ${{ matrix.target.version }}
+          SCAN_OUTCOME: ${{ steps.trivy.outcome }}
+        run: python3 -m sentinel summary
+      - name: Save full report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scan-${{ strategy.job-index }}
+          path: |
+            results.json
+            revision.json
+          if-no-files-found: warn
+          retention-days: 30
