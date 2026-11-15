@@ -56,8 +56,8 @@ class CombinedReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp) / 'scan-0'
             folder.mkdir()
-            (folder / 'status.json').write_text(json.dumps({'repository': 'a/b', 'version': 'v1', 'clone_outcome': 'success', 'scan_outcome': 'failure', 'gitleaks_outcome': 'success', 'semgrep_outcome': 'failure'}))
-            (folder / 'gitleaks.json').write_text(json.dumps({'scanner': 'gitleaks', 'findings': [{'rule': 'test-rule', 'path': 'file', 'line': 2}]}))
+            (folder / 'status.json').write_text(json.dumps({'repository': 'a/b', 'version': 'v1', 'clone_outcome': 'success', 'scan_outcome': 'failure', 'semgrep_outcome': 'success'}))
+            (folder / 'semgrep.json').write_text(json.dumps({'scanner': 'semgrep', 'findings': [{'rule': 'test-rule', 'path': 'file', 'line': 2}]}))
             report = combined_report([Target('a/b', 'v1')], Path(tmp))
             self.assertIn('Incomplete', report)
             self.assertIn('test-rule', report)

@@ -90,9 +90,9 @@ def clone_target(target: Target, path: Path) -> dict[str, Any]:
     try:
         tag_fetch = run_git(path, 'fetch', '--tags', 'origin')
         if tag_fetch.returncode:
-            warnings.append('Some remote tags could not be fetched; history coverage is incomplete.')
+            warnings.append('Some remote tags could not be fetched; version resolution may be incomplete.')
     except subprocess.TimeoutExpired:
-        warnings.append('Tag fetch timed out; history coverage is incomplete.')
+        warnings.append('Tag fetch timed out; version resolution may be incomplete.')
     commit, matched = resolve_revision(path, target.version)
     result = run_git(path, 'checkout', '--quiet', '--detach', commit)
     if result.returncode:
@@ -103,7 +103,7 @@ def clone_target(target: Target, path: Path) -> dict[str, Any]:
             if submodules.returncode:
                 warnings.append('One or more submodules could not be fetched; source coverage is incomplete.')
             else:
-                warnings.append('Submodules fetched at recorded commits; their Git history and Git LFS content are not verified.')
+                warnings.append('Submodules fetched at recorded commits; their Git LFS content is not verified.')
         except subprocess.TimeoutExpired:
             warnings.append('Submodule fetch timed out; source coverage is incomplete.')
     try:

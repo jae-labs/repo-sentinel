@@ -10,22 +10,6 @@ from typing import Any
 from sentinel.scanner import cell, short_description
 
 
-def normalize_gitleaks(raw: Any, scanner: str = 'gitleaks') -> dict[str, Any]:
-    if raw is None:
-        raw = []
-    if not isinstance(raw, list):
-        raise ValueError('Gitleaks report must be an array')
-    results = []
-    for item in raw:
-        if not isinstance(item, dict):
-            raise ValueError('Invalid Gitleaks finding')
-        commit = str(item.get('Commit') or '')
-        if not re.fullmatch(r'[0-9a-fA-F]{40,64}', commit):
-            commit = ''
-        results.append({'rule': str(item.get('RuleID') or 'unknown'), 'path': str(item.get('File') or 'unknown'), 'line': item.get('StartLine'), 'commit': commit})
-    return {'scanner': scanner, 'findings': results}
-
-
 def normalize_semgrep(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict) or not isinstance(raw.get('results'), list) or not isinstance(raw.get('errors'), list):
         raise ValueError('Invalid Semgrep report')
@@ -48,7 +32,9 @@ def normalize_semgrep(raw: Any) -> dict[str, Any]:
 
 def normalize_file(scanner: str, source: Path, destination: Path) -> None:
     raw = json.loads(source.read_text(encoding='utf-8'))
-    report = normalize_gitleaks(raw, scanner) if scanner in ('gitleaks', 'gitleaks_history') else normalize_semgrep(raw)
+    if scanner != 'semgrep':
+        raise ValueError(f'Unsupported scanner: {scanner}')
+    report = normalize_semgrep(raw)
     destination.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 
 

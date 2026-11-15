@@ -24,12 +24,13 @@ def main() -> int:
     specialized = sub.add_parser('specialized')
     specialized.add_argument('path', type=Path)
     normalize = sub.add_parser('normalize')
-    normalize.add_argument('scanner', choices=['gitleaks', 'gitleaks_history', 'semgrep'])
+    normalize.add_argument('scanner', choices=['semgrep'])
     normalize.add_argument('source', type=Path)
     normalize.add_argument('destination', type=Path)
     aggregate = sub.add_parser('aggregate')
     aggregate.add_argument('inventory', type=Path)
     aggregate.add_argument('artifacts', type=Path)
+    aggregate.add_argument('--cisa-catalog', type=Path)
     args = parser.parse_args()
     if args.command == 'inventory':
         targets = parse_inventory(json.loads(args.path.read_text(encoding='utf-8')))
@@ -56,12 +57,12 @@ def main() -> int:
             print(f'::warning::Requested version not found for {target.repo}; scanning default branch.')
     elif args.command == 'aggregate':
         targets = parse_inventory(json.loads(args.inventory.read_text(encoding='utf-8')))
-        report = combined_report(targets, args.artifacts)
+        report = combined_report(targets, args.artifacts, args.cisa_catalog)
         Path('combined-report.md').write_text(report, encoding='utf-8')
         with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as out:
             out.write(summary_excerpt(report))
     else:
-        Path('status.json').write_text(json.dumps({'repository': os.environ['TARGET_REPO'], 'version': os.environ['TARGET_VERSION'], 'clone_outcome': os.environ['CLONE_OUTCOME'], 'scan_outcome': os.environ['SCAN_OUTCOME'], 'gitleaks_outcome': os.environ['GITLEAKS_OUTCOME'], 'gitleaks_history_outcome': os.environ['GITLEAKS_HISTORY_OUTCOME'], 'semgrep_outcome': os.environ['SEMGREP_OUTCOME'], 'specialized_outcome': os.environ['SPECIALIZED_OUTCOME'], 'image_outcome': os.environ['IMAGE_OUTCOME'], 'image': os.environ['IMAGE_REF'], 'platform': os.environ['IMAGE_PLATFORM']}) + '\n', encoding='utf-8')
+        Path('status.json').write_text(json.dumps({'repository': os.environ['TARGET_REPO'], 'version': os.environ['TARGET_VERSION'], 'clone_outcome': os.environ['CLONE_OUTCOME'], 'scan_outcome': os.environ['SCAN_OUTCOME'], 'semgrep_outcome': os.environ['SEMGREP_OUTCOME'], 'specialized_outcome': os.environ['SPECIALIZED_OUTCOME'], 'image_outcome': os.environ['IMAGE_OUTCOME'], 'image': os.environ['IMAGE_REF'], 'platform': os.environ['IMAGE_PLATFORM']}) + '\n', encoding='utf-8')
         revision_path, report_path = Path('revision.json'), Path('results.json')
         revision = json.loads(revision_path.read_text(encoding='utf-8')) if revision_path.exists() else None
         report = json.loads(report_path.read_text(encoding='utf-8')) if report_path.exists() else None
@@ -81,7 +82,7 @@ def main() -> int:
                     out.write('\n**Image scan diagnostics are incomplete or contain errors.**\n')
             else:
                 out.write('\n### Container image\n\nNot scanned: no image configured.\n')
-            for name in ('gitleaks', 'gitleaks_history', 'semgrep', 'specialized'):
+            for name in ('semgrep', 'specialized'):
                 path = Path(name + '.json')
                 report_extra = json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
                 out.write('\n' + render_extra(name.title(), os.environ[name.upper() + '_OUTCOME'], report_extra))

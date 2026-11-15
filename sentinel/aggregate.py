@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from sentinel.extra_scanners import render_extra
+from sentinel.kev import kev_section
 from sentinel.scanner import Target, cell, diagnostics_summary, findings, render_summary
 
 
@@ -17,11 +18,11 @@ def read_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def combined_report(targets: list[Target], artifacts: Path) -> str:
+def combined_report(targets: list[Target], artifacts: Path, catalog_path: Path | None = None) -> str:
     overview: list[str] = []
     details: list[str] = []
     completed = failed = unmatched = partial = no_dependencies = high = critical = 0
-    scanner_counts: Counter[str] = Counter({'Trivy': 0, 'Trivy image': 0, 'gitleaks': 0, 'gitleaks_history': 0, 'semgrep': 0, 'OSV-Scanner': 0, 'Bandit': 0, 'Hadolint': 0})
+    scanner_counts: Counter[str] = Counter({'Trivy': 0, 'Trivy image': 0, 'semgrep': 0, 'OSV-Scanner': 0, 'Bandit': 0, 'Hadolint': 0})
     possible_duplicates = 0
     for index, target in enumerate(targets):
         directory = artifacts / f'scan-{index}'
@@ -66,7 +67,7 @@ def combined_report(targets: list[Target], artifacts: Path) -> str:
                 match += '; dependency coverage unknown'
             overview.append(f'| {cell(target.repo)} | {cell(target.version)} | {match} | {c} | {h} |')
             extra_sections = []
-            for name in ('gitleaks', 'gitleaks_history', 'semgrep', 'specialized'):
+            for name in ('semgrep', 'specialized'):
                 outcome = status.get(name + '_outcome', 'missing')
                 valid_extra = True
                 try:
@@ -126,7 +127,7 @@ def combined_report(targets: list[Target], artifacts: Path) -> str:
             detail = f'## {cell(target.repo)}\n\n**Trivy or target incomplete:** {cell(str(exc))}. Check the job logs and individual artifact.\n'
             try:
                 status = read_object(directory / 'status.json')
-                for name in ('gitleaks', 'gitleaks_history', 'semgrep', 'specialized'):
+                for name in ('semgrep', 'specialized'):
                     try:
                         extra = read_object(directory / (name + '.json'))
                     except (OSError, ValueError):
@@ -162,7 +163,7 @@ def combined_report(targets: list[Target], artifacts: Path) -> str:
                '| --- | --- | --- | ---: | ---: |\n')
     if not targets:
         heading += '| No targets configured | — | — | — | — |\n'
-    return heading + '\n'.join(overview) + '\n\n' + '\n'.join(details)
+    return heading + '\n'.join(overview) + '\n\n' + kev_section(targets, artifacts, catalog_path) + '\n'.join(details)
 
 
 def summary_excerpt(report: str, byte_limit: int = 900_000) -> str:
