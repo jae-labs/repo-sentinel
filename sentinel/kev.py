@@ -1,4 +1,5 @@
 """Match scanner findings against CISA KEV."""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from sentinel.extra_scanners import dependency_scope
+from sentinel.reports import parse_specialized, valid_trivy_report
 from sentinel.scanner import Target, cell
 
 CVE = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
@@ -38,16 +40,20 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
         if catalog_path is None:
             raise ValueError('No catalog configured')
         catalog, released = load_catalog(catalog_path)
-    except (OSError, ValueError, TypeError):
+    except OSError, ValueError, TypeError:
         return heading + '**CISA catalog unavailable.**\n\n'
     evidence: dict[tuple[str, str], set[tuple[str, str, str, str, str]]] = defaultdict(set)
     for index, target in enumerate(targets):
         directory = artifacts / f'scan-{index}'
         try:
             status = json.loads((directory / 'status.json').read_text(encoding='utf-8'))
-            if not isinstance(status, dict) or status.get('repository') != target.repo or status.get('version') != target.version:
+            if (
+                not isinstance(status, dict)
+                or status.get('repository') != target.repo
+                or status.get('version') != target.version
+            ):
                 continue
-        except (OSError, ValueError):
+        except OSError, ValueError:
             continue
         pinned_source = True
         if target.source_commit:
@@ -59,9 +65,12 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
                     and revision.get('commit') == target.source_commit
                     and revision.get('matched_version') is True
                 )
-            except (OSError, ValueError, AttributeError):
+            except OSError, ValueError, AttributeError:
                 pinned_source = False
-        for filename, outcome, label in (('results.json', 'scan_outcome', 'Source'), ('image-results.json', 'image_outcome', 'Image')):
+        for filename, outcome, label in (
+            ('results.json', 'scan_outcome', 'Source'),
+            ('image-results.json', 'image_outcome', 'Image'),
+        ):
             if status.get(outcome) != 'success':
                 continue
             if label == 'Source' and not pinned_source:
@@ -70,7 +79,7 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
                 continue
             try:
                 report = json.loads((directory / filename).read_text(encoding='utf-8'))
-                if report.get('SchemaVersion') != 2 or not isinstance(report.get('Results', []), list):
+                if not isinstance(report, dict) or not valid_trivy_report(report):
                     continue
                 for result in report.get('Results') or []:
                     for item in result.get('Vulnerabilities') or []:
@@ -81,22 +90,38 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
                             if isinstance(item.get(field), list):
                                 ids.extend(item[field])
                         for cve in finding_cves(ids) & catalog.keys():
-                            evidence[(target.repo, cve)].add((label, str(result.get('Target') or '—'), str(item.get('PkgName') or '—'), str(item.get('InstalledVersion') or '—'), str(item.get('FixedVersion') or '—')))
-            except (OSError, ValueError, TypeError, AttributeError):
+                            evidence[(target.repo, cve)].add(
+                                (
+                                    label,
+                                    str(result.get('Target') or '—'),
+                                    str(item.get('PkgName') or '—'),
+                                    str(item.get('InstalledVersion') or '—'),
+                                    str(item.get('FixedVersion') or '—'),
+                                )
+                            )
+            except OSError, ValueError, TypeError, AttributeError:
                 continue
         if pinned_source and status.get('specialized_outcome') == 'success':
             try:
-                report = json.loads((directory / 'specialized.json').read_text(encoding='utf-8'))
-                if report.get('scanner') != 'specialized' or not isinstance(report.get('findings'), list):
+                raw = json.loads((directory / 'specialized.json').read_text(encoding='utf-8'))
+                specialized = parse_specialized(raw) if isinstance(raw, dict) else None
+                if specialized is None:
                     continue
-                for item in report['findings']:
+                for item in specialized['findings']:
                     if item.get('scanner') != 'OSV-Scanner':
                         continue
-                    aliases = item.get('aliases') if isinstance(item.get('aliases'), list) else []
+                    aliases = item.get('aliases', [])
                     for cve in finding_cves([item.get('rule'), *aliases]) & catalog.keys():
-                        fixed = item.get('fixed') if isinstance(item.get('fixed'), list) else []
-                        evidence[(target.repo, cve)].add(('Source', str(item.get('path') or '—'), str(item.get('package') or '—'), str(item.get('version') or '—'), ', '.join(map(str, fixed)) or '—'))
-            except (OSError, ValueError, TypeError, AttributeError):
+                        evidence[(target.repo, cve)].add(
+                            (
+                                'Source',
+                                str(item.get('path') or '—'),
+                                str(item.get('package') or '—'),
+                                str(item.get('version') or '—'),
+                                ', '.join(item.get('fixed', [])) or '—',
+                            )
+                        )
+            except OSError, ValueError, TypeError, AttributeError:
                 continue
     text = heading + f'[CISA catalog]({CATALOG_URL}) · {cell(released.partition("T")[0])}\n\n'
     if not evidence:
@@ -113,7 +138,13 @@ def kev_section(targets: list[Target], artifacts: Path, catalog_path: Path | Non
             if label == 'Source' and dependency_scope(location) == 'development/test':
                 label = 'Dev/test'
             sources.add(label if location == '—' else f'{label} · {location}')
-        packages = '<br>'.join(cell(f'{", ".join(sorted(names))} {version} → {fixed}') for (version, fixed), names in sorted(packages_by_version.items())) or '—'
+        packages = (
+            '<br>'.join(
+                cell(f'{", ".join(sorted(names))} {version} → {fixed}')
+                for (version, fixed), names in sorted(packages_by_version.items())
+            )
+            or '—'
+        )
         locations = '<br>'.join(cell(source) for source in sorted(sources))
         text += f'| {cell(repo)} | [{cve}](https://www.cve.org/CVERecord?id={cve}) | {locations} | {packages} |\n'
     return text + '\n'

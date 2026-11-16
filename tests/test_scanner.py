@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 import sys
@@ -7,7 +6,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sentinel.scanner import Target, clone_target, findings, parse_inventory, render_summary, resolve_revision, scan_diagnostics, diagnostics_summary
+from sentinel.scanner import (
+    Target,
+    clone_target,
+    diagnostics_summary,
+    findings,
+    parse_inventory,
+    render_summary,
+    resolve_revision,
+    scan_diagnostics,
+)
 
 
 class InventoryTests(unittest.TestCase):
@@ -16,17 +24,28 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(parse_inventory([{'repo': 'owner/repo', 'version': 'v1'}])[0].repo, 'owner/repo')
 
     def test_invalid_and_duplicate(self):
-        for value in ({}, [None], [{'repo': '../x', 'version': 'v1'}],
-                      [{'repo': 'a/b', 'version': '--evil'}],
-                      [{'repo': 'a/b', 'version': ''}],
-                      [{'repo': 'A/b', 'version': '1'}, {'repo': 'a/B', 'version': '2'}]):
+        for value in (
+            {},
+            [None],
+            [{'repo': '../x', 'version': 'v1'}],
+            [{'repo': 'a/b', 'version': '--evil'}],
+            [{'repo': 'a/b', 'version': ''}],
+            [{'repo': 'A/b', 'version': '1'}, {'repo': 'a/B', 'version': '2'}],
+        ):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_inventory(value)
 
     def test_optional_image_and_platform_validation(self):
-        target = parse_inventory([{'repo': 'a/b', 'version': 'v1', 'image': 'ghcr.io/a/b@sha256:' + 'a' * 64, 'platform': 'linux/arm64'}])[0]
+        target = parse_inventory(
+            [{'repo': 'a/b', 'version': 'v1', 'image': 'ghcr.io/a/b@sha256:' + 'a' * 64, 'platform': 'linux/arm64'}]
+        )[0]
         self.assertEqual(target.platform, 'linux/arm64')
-        for extra in ({'image': 'bad image'}, {'image': 'a/b@sha256:abcd'}, {'platform': 'linux/arm64'}, {'image': 'a/b', 'platform': '../../x'}):
+        for extra in (
+            {'image': 'bad image'},
+            {'image': 'a/b@sha256:abcd'},
+            {'platform': 'linux/arm64'},
+            {'image': 'a/b', 'platform': '../../x'},
+        ):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 parse_inventory([{'repo': 'a/b', 'version': 'v1', **extra}])
 
@@ -48,11 +67,18 @@ class InventoryTests(unittest.TestCase):
             root = Path(tmp)
             (root / 'inventory.json').write_text('[]')
             env = dict(os.environ, GITHUB_OUTPUT=str(root / 'output'), GITHUB_STEP_SUMMARY=str(root / 'summary'))
-            subprocess.run([sys.executable, '-m', 'sentinel', 'inventory', str(root / 'inventory.json')], env=env, check=True)
+            subprocess.run(
+                [sys.executable, '-m', 'sentinel', 'inventory', str(root / 'inventory.json')], env=env, check=True
+            )
             self.assertIn('has_targets=false', (root / 'output').read_text())
             self.assertFalse((root / 'summary').exists())
             env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1])
-            subprocess.run([sys.executable, '-m', 'sentinel', 'aggregate', 'inventory.json', 'artifacts'], cwd=root, env=env, check=True)
+            subprocess.run(
+                [sys.executable, '-m', 'sentinel', 'aggregate', 'inventory.json', 'artifacts'],
+                cwd=root,
+                env=env,
+                check=True,
+            )
             self.assertIn('No targets configured', (root / 'summary').read_text())
 
 
@@ -60,8 +86,15 @@ class RevisionTests(unittest.TestCase):
     def test_resolves_tags_commits_and_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
+
             def git(*args):
-                return subprocess.run(['git', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', '-C', str(path), *args], check=True, text=True, capture_output=True).stdout.strip()
+                return subprocess.run(
+                    ['git', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', '-C', str(path), *args],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+
             git('init', '-q')
             git('config', 'user.email', 'tests@example.invalid')
             git('config', 'user.name', 'Test')
@@ -78,16 +111,23 @@ class RevisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'target'
             calls = []
+
             def fake_git(where, *args):
                 calls.append(args)
                 if args[0] == 'clone':
-                    path.mkdir(); (path / '.gitmodules').write_text('[submodule]')
+                    path.mkdir()
+                    (path / '.gitmodules').write_text('[submodule]')
                 code = 1 if args[:2] == ('submodule', 'update') or args[:2] == ('lfs', 'ls-files') else 0
                 return subprocess.CompletedProcess(args, code, '', '')
+
             def fake_resolve(where, version):
                 self.assertIn(('fetch', '--tags', 'origin'), calls)
                 return 'abc', True
-            with patch('sentinel.scanner.run_git', side_effect=fake_git), patch('sentinel.scanner.resolve_revision', side_effect=fake_resolve):
+
+            with (
+                patch('sentinel.scanner.run_git', side_effect=fake_git),
+                patch('sentinel.scanner.resolve_revision', side_effect=fake_resolve),
+            ):
                 revision = clone_target(Target('owner/repo', 'v1'), path)
             self.assertTrue(any('Submodule' in x for x in revision['source_warnings']))
             self.assertTrue(any('LFS' in x for x in revision['source_warnings']))
@@ -95,7 +135,11 @@ class RevisionTests(unittest.TestCase):
     def test_source_pin_preserves_version_and_rejects_fallback(self):
         source_commit = 'a' * 40
         target = Target('owner/repo', 'v1', source_commit=source_commit)
-        with tempfile.TemporaryDirectory() as tmp, patch('sentinel.scanner.run_git') as git, patch('sentinel.scanner.resolve_revision') as resolve:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch('sentinel.scanner.run_git') as git,
+            patch('sentinel.scanner.resolve_revision') as resolve,
+        ):
             git.return_value = subprocess.CompletedProcess([], 0, '', '')
             path = Path(tmp)
             resolve.return_value = (source_commit, True)
@@ -110,10 +154,33 @@ class RevisionTests(unittest.TestCase):
 
 class ReportTests(unittest.TestCase):
     def test_findings_and_render(self):
-        report = {'Results': [{'Target': 'package-lock.json', 'Vulnerabilities': [
-            {'VulnerabilityID': 'CVE-1', 'Severity': 'HIGH', 'PkgName': 'a|b', 'Title': 'Request smuggling | issue', 'InstalledVersion': '1', 'FixedVersion': '2', 'PrimaryURL': 'https://example.org/CVE-1'},
-            {'VulnerabilityID': 'CVE-2', 'Severity': 'LOW'}],
-            'Misconfigurations': [{'ID': 'DS-1', 'Severity': 'CRITICAL', 'Title': 'Missing USER', 'Message': 'Container runs as root'}]}]}
+        report = {
+            'Results': [
+                {
+                    'Target': 'package-lock.json',
+                    'Vulnerabilities': [
+                        {
+                            'VulnerabilityID': 'CVE-1',
+                            'Severity': 'HIGH',
+                            'PkgName': 'a|b',
+                            'Title': 'Request smuggling | issue',
+                            'InstalledVersion': '1',
+                            'FixedVersion': '2',
+                            'PrimaryURL': 'https://example.org/CVE-1',
+                        },
+                        {'VulnerabilityID': 'CVE-2', 'Severity': 'LOW'},
+                    ],
+                    'Misconfigurations': [
+                        {
+                            'ID': 'DS-1',
+                            'Severity': 'CRITICAL',
+                            'Title': 'Missing USER',
+                            'Message': 'Container runs as root',
+                        }
+                    ],
+                }
+            ]
+        }
         rows = findings(report)
         self.assertEqual([row['id'] for row in rows], ['DS-1', 'CVE-1'])
         summary = render_summary('owner/repo', 'v1', {'commit': 'abc', 'matched_version': False}, report, 'success')

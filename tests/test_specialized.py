@@ -6,15 +6,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sentinel.specialized import detect, fixed_versions, scan
+from sentinel.specialized import advisory_severity, detect, fixed_versions, scan
 
 
 class SpecializedTests(unittest.TestCase):
     def test_detects_nested_files_and_skips_ignored_and_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / 'app').mkdir(); (root / 'node_modules').mkdir()
-            for name in ('app/main.py', 'app/go.mod', 'app/package-lock.json', 'app/Dockerfile', 'app/Dockerfile.dockerignore', 'node_modules/skip.py'):
+            (root / 'app').mkdir()
+            (root / 'node_modules').mkdir()
+            for name in (
+                'app/main.py',
+                'app/go.mod',
+                'app/package-lock.json',
+                'app/Dockerfile',
+                'app/Dockerfile.dockerignore',
+                'node_modules/skip.py',
+            ):
                 (root / name).write_text('test')
             (root / 'link.py').symlink_to(root / 'app/main.py')
             items = detect(root)
@@ -29,17 +37,52 @@ class SpecializedTests(unittest.TestCase):
             (root / 'app.py').write_text('pass')
             (root / 'requirements.txt').write_text('example==1')
             (root / 'Dockerfile').write_text('FROM example:1')
+
             def fake_run(args, **kwargs):
                 if args[0] == 'osv-scanner':
                     self.assertNotIn('--no-resolve', args)
-                    data = {'results': [{'source': {'path': 'requirements.txt'}, 'packages': [{'package': {'name': 'example', 'version': '1'}, 'vulnerabilities': [{'id': 'CVE-TEST', 'summary': 'Affected package'}]}]}]}
+                    data = {
+                        'results': [
+                            {
+                                'source': {'path': 'requirements.txt'},
+                                'packages': [
+                                    {
+                                        'package': {'name': 'example', 'version': '1'},
+                                        'vulnerabilities': [{'id': 'CVE-TEST', 'summary': 'Affected package'}],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
                     return subprocess.CompletedProcess(args, 1, json.dumps(data), '')
                 if args[0] == 'bandit':
-                    return subprocess.CompletedProcess(args, 0, json.dumps({'results': [{'test_id': 'B101', 'filename': 'app.py', 'line_number': 1, 'issue_severity': 'LOW', 'issue_text': 'test'}], 'errors': []}), '')
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        json.dumps(
+                            {
+                                'results': [
+                                    {
+                                        'test_id': 'B101',
+                                        'filename': 'app.py',
+                                        'line_number': 1,
+                                        'issue_severity': 'LOW',
+                                        'issue_text': 'test',
+                                    }
+                                ],
+                                'errors': [],
+                            }
+                        ),
+                        '',
+                    )
                 return subprocess.CompletedProcess(args, 1, 'not json', '')
-            with patch('sentinel.specialized.shutil.which', return_value='/bin/tool'), patch('sentinel.specialized.run', side_effect=fake_run):
+
+            with (
+                patch('sentinel.specialized.shutil.which', return_value='/bin/tool'),
+                patch('sentinel.specialized.run', side_effect=fake_run),
+            ):
                 result = scan(root)
-            self.assertEqual([item['status'] for item in result['coverage']], ['completed', 'completed', 'partial'])
+            self.assertEqual([item['status'] for item in result['coverage']], ['completed', 'completed', 'incomplete'])
             self.assertEqual({item['rule'] for item in result['findings']}, {'CVE-TEST', 'B101'})
 
     def test_bandit_batches_preserve_successes_when_one_fails(self):
@@ -48,14 +91,21 @@ class SpecializedTests(unittest.TestCase):
             for n in range(101):
                 (root / f'file{n:03}.py').write_text('pass')
             calls = []
+
             def fake_run(args, **kwargs):
                 if args[0] == 'osv-scanner':
                     return subprocess.CompletedProcess(args, 128, '', '')
                 calls.append(args)
                 if len(calls) == 2:
                     return subprocess.CompletedProcess(args, -9, '', 'sensitive diagnostic')
-                return subprocess.CompletedProcess(args, 0, json.dumps({'results': [{'test_id': 'B101', 'filename': 'file.py'}], 'errors': []}), '')
-            with patch('sentinel.specialized.shutil.which', return_value='/bin/tool'), patch('sentinel.specialized.run', side_effect=fake_run):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({'results': [{'test_id': 'B101', 'filename': 'file.py'}], 'errors': []}), ''
+                )
+
+            with (
+                patch('sentinel.specialized.shutil.which', return_value='/bin/tool'),
+                patch('sentinel.specialized.run', side_effect=fake_run),
+            ):
                 result = scan(root)
             self.assertEqual(len(calls), 2)
             self.assertEqual(result['coverage'][1]['status'], 'partial')
@@ -64,12 +114,39 @@ class SpecializedTests(unittest.TestCase):
             self.assertEqual(len(result['findings']), 1)
 
     def test_fixed_versions_match_package_and_ecosystem(self):
-        vuln = {'affected': [
-            {'package': {'name': 'pillow', 'ecosystem': 'PyPI'}, 'ranges': [{'type': 'ECOSYSTEM', 'events': [{'fixed': '10.0.1'}]}, {'type': 'GIT', 'events': [{'fixed': 'abcdef123'}]}]},
-            {'package': {'name': 'pillow', 'ecosystem': 'Go'}, 'ranges': [{'type': 'SEMVER', 'events': [{'fixed': '99.0'}]}]},
-        ]}
+        vuln = {
+            'affected': [
+                {
+                    'package': {'name': 'pillow', 'ecosystem': 'PyPI'},
+                    'ranges': [
+                        {'type': 'ECOSYSTEM', 'events': [{'fixed': '10.0.1'}]},
+                        {'type': 'GIT', 'events': [{'fixed': 'abcdef123'}]},
+                    ],
+                },
+                {
+                    'package': {'name': 'pillow', 'ecosystem': 'Go'},
+                    'ranges': [{'type': 'SEMVER', 'events': [{'fixed': '99.0'}]}],
+                },
+            ]
+        }
         self.assertEqual(fixed_versions(vuln, {'name': 'pillow', 'ecosystem': 'PyPI'}), ['10.0.1'])
         self.assertEqual(fixed_versions(vuln, {'name': 'pillow'}), [])
+
+    def test_standard_osv_severity(self):
+        entry = {'type': 'CVSS_V3', 'score': 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'}
+        self.assertEqual(advisory_severity({'severity': [entry]}), 'CRITICAL')
+        v4 = {'type': 'CVSS_V4', 'score': 'CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N'}
+        self.assertEqual(advisory_severity({'severity': [v4]}), 'CRITICAL')
+        self.assertEqual(
+            advisory_severity({'severity': [{'type': 'CVSS_V2', 'score': 'AV:N/AC:L/Au:N/C:C/I:C/A:C'}]}),
+            'HIGH',
+        )
+        package = {'name': 'example', 'ecosystem': 'PyPI'}
+        advisory = {'affected': [{'package': package, 'severity': [entry]}]}
+        self.assertEqual(advisory_severity(advisory, package), 'CRITICAL')
+        self.assertEqual(advisory_severity(advisory, {'name': 'other', 'ecosystem': 'PyPI'}), 'UNRATED')
+        fallback = {'severity': [{'type': 'CVSS_V4', 'score': 'invalid'}], 'database_specific': {'severity': 'HIGH'}}
+        self.assertEqual(advisory_severity(fallback), 'HIGH')
 
     @unittest.skipUnless(shutil.which('bandit'), 'Bandit CLI not installed')
     def test_real_bandit_large_batch_json(self):
@@ -78,7 +155,9 @@ class SpecializedTests(unittest.TestCase):
             for i in range(101):
                 (root / f'file{i:03}.py').write_text('assert True\n')
             bandit_path = shutil.which('bandit')
-            with patch('sentinel.specialized.shutil.which', side_effect=lambda name: bandit_path if name == 'bandit' else None):
+            with patch(
+                'sentinel.specialized.shutil.which', side_effect=lambda name: bandit_path if name == 'bandit' else None
+            ):
                 result = scan(root)
             bandit = next(row for row in result['coverage'] if row['scanner'] == 'Bandit')
             self.assertEqual(bandit['status'], 'completed')
@@ -93,11 +172,22 @@ class SpecializedTests(unittest.TestCase):
                 if args[0] == 'osv-scanner':
                     self.assertEqual(kwargs['timeout'], 300)
                     raise subprocess.TimeoutExpired(args, kwargs['timeout'])
-                return subprocess.CompletedProcess(args, 0, json.dumps({
-                    'results': [{'test_id': 'B608', 'issue_severity': 'HIGH'}], 'errors': [],
-                }), '')
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    json.dumps(
+                        {
+                            'results': [{'test_id': 'B608', 'issue_severity': 'HIGH'}],
+                            'errors': [],
+                        }
+                    ),
+                    '',
+                )
 
-            with patch('sentinel.specialized.shutil.which', return_value='/bin/tool'), patch('sentinel.specialized.run', side_effect=fake_run) as runner:
+            with (
+                patch('sentinel.specialized.shutil.which', return_value='/bin/tool'),
+                patch('sentinel.specialized.run', side_effect=fake_run) as runner,
+            ):
                 result = scan(root)
             self.assertEqual(result['coverage'][0]['status'], 'incomplete')
             self.assertIn('timed out after 5 minutes', result['coverage'][0]['detail'])
@@ -115,10 +205,15 @@ class SpecializedTests(unittest.TestCase):
             root = Path(tmp)
             (root / 'pom.xml').write_text('<project/>')
             calls = []
+
             def fake_run(args, **kwargs):
                 calls.append(args)
                 return subprocess.CompletedProcess(args, 128, '', '')
-            with patch('sentinel.specialized.shutil.which', return_value='/bin/tool'), patch('sentinel.specialized.run', side_effect=fake_run):
+
+            with (
+                patch('sentinel.specialized.shutil.which', return_value='/bin/tool'),
+                patch('sentinel.specialized.run', side_effect=fake_run),
+            ):
                 result = scan(root)
             self.assertEqual(calls[0][0], 'osv-scanner')
             self.assertEqual(result['coverage'][0]['status'], 'no packages')

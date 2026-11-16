@@ -1,4 +1,5 @@
 """GitHub Actions CLI."""
+
 from __future__ import annotations
 
 import argparse
@@ -8,11 +9,96 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from sentinel.specialized import scan as specialized_scan
-from sentinel.sarif import export_specialized_sarif, sanitize_file
+from sentinel.aggregate import SARIF_FILES, aggregate_reports, available_report, summary_excerpt
 from sentinel.extra_scanners import normalize_file, render_extra
-from sentinel.aggregate import SARIF_FILES, combined_report, summary_excerpt
+from sentinel.reports import parse_semgrep, parse_specialized, valid_trivy_report
+from sentinel.sarif import export_specialized_sarif, sanitize_file
 from sentinel.scanner import clone_target, diagnostics_summary, parse_inventory, render_summary, scan_diagnostics
+
+
+def write_scan_report() -> None:
+    Path('status.json').write_text(
+        json.dumps(
+            {
+                'repository': os.environ['TARGET_REPO'],
+                'version': os.environ['TARGET_VERSION'],
+                'clone_outcome': os.environ['CLONE_OUTCOME'],
+                'scan_outcome': os.environ['SCAN_OUTCOME'],
+                'semgrep_outcome': os.environ['SEMGREP_OUTCOME'],
+                'specialized_outcome': os.environ['SPECIALIZED_OUTCOME'],
+                'image_outcome': os.environ['IMAGE_OUTCOME'],
+                'image': os.environ['IMAGE_REF'],
+                'platform': os.environ['IMAGE_PLATFORM'],
+            }
+        )
+        + '\n',
+        encoding='utf-8',
+    )
+    revision_path, report_path = Path('revision.json'), Path('results.json')
+    raw_revision = available_report(revision_path)
+    revision = raw_revision if isinstance(raw_revision.get('matched_version'), bool) else None
+    raw_trivy = available_report(report_path)
+    report = raw_trivy if valid_trivy_report(raw_trivy) else None
+    log_path = Path('scan.log')
+    diagnostics = scan_diagnostics(
+        log_path.read_text(encoding='utf-8', errors='replace') if log_path.exists() else None
+    )
+    Path('diagnostics.json').write_text(json.dumps(diagnostics, indent=2) + '\n', encoding='utf-8')
+    summary = render_summary(
+        os.environ['TARGET_REPO'], os.environ['TARGET_VERSION'], revision, report, os.environ['SCAN_OUTCOME']
+    )
+    semgrep = parse_semgrep(available_report(Path('semgrep.json')))
+    specialized = parse_specialized(available_report(Path('specialized.json')))
+    scanner_reports = {
+        'semgrep': dict(semgrep) if semgrep is not None else None,
+        'specialized': dict(specialized) if specialized is not None else None,
+    }
+    coverage_notes = []
+    if os.environ['SEMGREP_OUTCOME'] != 'success' or semgrep is None:
+        coverage_notes.append('Semgrep report unavailable')
+    elif semgrep['errors']:
+        coverage_notes.append('Semgrep reported scan errors')
+    if os.environ['SPECIALIZED_OUTCOME'] != 'success' or specialized is None:
+        coverage_notes.append('Specialized report unavailable')
+    else:
+        for entry in specialized['coverage']:
+            if entry['status'] in ('incomplete', 'partial'):
+                coverage_notes.append(f'{entry["scanner"]} {entry["status"]}')
+    if coverage_notes:
+        summary = summary.replace('\n\n', '\n\n**Coverage needs review:** ' + ', '.join(coverage_notes) + '.\n\n', 1)
+    with Path('scan-report.md').open('w', encoding='utf-8') as out:
+        out.write(summary + '\n' + diagnostics_summary(diagnostics) + '\n')
+        image = os.environ['IMAGE_REF']
+        if image:
+            image_data = available_report(Path('image-results.json'))
+            image_report = image_data if valid_trivy_report(image_data) else None
+            out.write(
+                '\n### Container image\n\n'
+                + render_summary(
+                    image,
+                    os.environ['IMAGE_PLATFORM'] or 'runner default platform',
+                    None,
+                    image_report,
+                    os.environ['IMAGE_OUTCOME'],
+                    image=True,
+                )
+            )
+            image_log = Path('image-scan.log')
+            if (
+                not image_log.exists()
+                or scan_diagnostics(image_log.read_text(encoding='utf-8', errors='replace'))['errors']
+            ):
+                out.write('\n**Image scan diagnostics are incomplete or contain errors.**\n')
+        else:
+            out.write('\n### Container image\n\nNot scanned: no image configured.\n')
+        available = [name for name in SARIF_FILES if Path(name).is_file()]
+        out.write('\n### SARIF\n\n' + (', '.join(available) if available else 'None available') + '\n')
+        for name, scanner_report in scanner_reports.items():
+            out.write('\n' + render_extra(name.title(), os.environ[name.upper() + '_OUTCOME'], scanner_report))
+    if diagnostics['errors']:
+        print('::warning::Trivy reported scan errors. See the scan report.')
+    if os.environ['SCAN_OUTCOME'] != 'success' or report is None:
+        print('::error::Scan did not complete successfully; see job logs.')
 
 
 def main() -> int:
@@ -44,6 +130,8 @@ def main() -> int:
             print('targets=' + json.dumps([asdict(t) for t in targets], separators=(',', ':')), file=out)
             print('has_targets=' + str(bool(targets)).lower(), file=out)
     elif args.command == 'specialized':
+        from sentinel.specialized import scan as specialized_scan
+
         result = specialized_scan(args.path, resolve_osv=os.environ.get('OSV_RESOLVE') != 'false')
         Path('specialized.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
         if any(entry['status'] in ('incomplete', 'partial') for entry in result['coverage']):
@@ -55,11 +143,15 @@ def main() -> int:
     elif args.command == 'export-specialized-sarif':
         export_specialized_sarif(json.loads(args.source.read_text(encoding='utf-8')), Path('.'))
     elif args.command == 'clone':
-        target = parse_inventory([{
-            'repo': os.environ['TARGET_REPO'],
-            'version': os.environ['TARGET_VERSION'],
-            'source_commit': os.environ.get('SOURCE_COMMIT', ''),
-        }])[0]
+        target = parse_inventory(
+            [
+                {
+                    'repo': os.environ['TARGET_REPO'],
+                    'version': os.environ['TARGET_VERSION'],
+                    'source_commit': os.environ.get('SOURCE_COMMIT', ''),
+                }
+            ]
+        )[0]
         revision = clone_target(target, Path('target'))
         Path('revision.json').write_text(json.dumps(revision, indent=2) + '\n', encoding='utf-8')
         if revision.get('source_warnings'):
@@ -68,55 +160,18 @@ def main() -> int:
             print(f'::warning::Requested version unavailable for {target.repo}. Scanning the default branch.')
     elif args.command == 'aggregate':
         targets = parse_inventory(json.loads(args.inventory.read_text(encoding='utf-8')))
-        report = combined_report(targets, args.artifacts, args.cisa_catalog)
-        Path('combined-report.md').write_text(report, encoding='utf-8')
+        aggregate_result = aggregate_reports(targets, args.artifacts, args.cisa_catalog)
+        Path('combined-report.md').write_text(aggregate_result.markdown, encoding='utf-8')
         with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as out:
-            out.write(summary_excerpt(report))
-    else:
-        Path('status.json').write_text(json.dumps({'repository': os.environ['TARGET_REPO'], 'version': os.environ['TARGET_VERSION'], 'clone_outcome': os.environ['CLONE_OUTCOME'], 'scan_outcome': os.environ['SCAN_OUTCOME'], 'semgrep_outcome': os.environ['SEMGREP_OUTCOME'], 'specialized_outcome': os.environ['SPECIALIZED_OUTCOME'], 'image_outcome': os.environ['IMAGE_OUTCOME'], 'image': os.environ['IMAGE_REF'], 'platform': os.environ['IMAGE_PLATFORM']}) + '\n', encoding='utf-8')
-        revision_path, report_path = Path('revision.json'), Path('results.json')
-        revision = json.loads(revision_path.read_text(encoding='utf-8')) if revision_path.exists() else None
-        report = json.loads(report_path.read_text(encoding='utf-8')) if report_path.exists() else None
-        log_path = Path('scan.log')
-        diagnostics = scan_diagnostics(log_path.read_text(encoding='utf-8', errors='replace') if log_path.exists() else None)
-        Path('diagnostics.json').write_text(json.dumps(diagnostics, indent=2) + '\n', encoding='utf-8')
-        summary = render_summary(os.environ['TARGET_REPO'], os.environ['TARGET_VERSION'], revision, report, os.environ['SCAN_OUTCOME'])
-        scanner_reports = {}
-        for name in ('semgrep', 'specialized'):
-            path = Path(name + '.json')
-            scanner_reports[name] = json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
-        coverage_notes = []
-        for name, scanner_report in scanner_reports.items():
-            if os.environ[name.upper() + '_OUTCOME'] != 'success' or scanner_report is None:
-                coverage_notes.append(f'{name.title()} report unavailable')
-                continue
-            if name == 'semgrep' and scanner_report.get('errors'):
-                coverage_notes.append('Semgrep reported scan errors')
-            for entry in scanner_report.get('coverage', []):
-                if entry['status'] in ('incomplete', 'partial'):
-                    coverage_notes.append(f"{entry['scanner']} {entry['status']}")
-        if coverage_notes:
-            summary = summary.replace('\n\n', '\n\n**Coverage needs review:** ' + ', '.join(coverage_notes) + '.\n\n', 1)
-        with Path('scan-report.md').open('w', encoding='utf-8') as out:
-            out.write(summary + '\n' + diagnostics_summary(diagnostics) + '\n')
-            image = os.environ['IMAGE_REF']
-            if image:
-                image_path = Path('image-results.json')
-                image_report = json.loads(image_path.read_text(encoding='utf-8')) if image_path.exists() else None
-                out.write('\n### Container image\n\n' + render_summary(image, os.environ['IMAGE_PLATFORM'] or 'runner default platform', None, image_report, os.environ['IMAGE_OUTCOME'], image=True))
-                image_log = Path('image-scan.log')
-                if not image_log.exists() or scan_diagnostics(image_log.read_text(encoding='utf-8', errors='replace'))['errors']:
-                    out.write('\n**Image scan diagnostics are incomplete or contain errors.**\n')
-            else:
-                out.write('\n### Container image\n\nNot scanned: no image configured.\n')
-            available = [name for name in SARIF_FILES if Path(name).is_file()]
-            out.write('\n### SARIF\n\n' + (', '.join(available) if available else 'None available') + '\n')
-            for name, scanner_report in scanner_reports.items():
-                out.write('\n' + render_extra(name.title(), os.environ[name.upper() + '_OUTCOME'], scanner_report))
-        if diagnostics['errors']:
-            print('::warning::Trivy reported scan errors. See the scan report.')
-        if os.environ['SCAN_OUTCOME'] != 'success' or report is None:
-            print('::error::Scan did not complete successfully; see job logs.')
+            out.write(summary_excerpt(aggregate_result.markdown))
+        if aggregate_result.incomplete_targets:
+            print(
+                f'::error::{aggregate_result.incomplete_targets}/{len(targets)} target scans incomplete. '
+                'See the combined report.'
+            )
+            return 1
+    elif args.command == 'summary':
+        write_scan_report()
     return 0
 
 

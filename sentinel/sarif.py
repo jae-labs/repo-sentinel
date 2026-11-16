@@ -1,4 +1,5 @@
 """Produce a conservative SARIF artifact without scanner-provided source text."""
+
 from __future__ import annotations
 
 import json
@@ -21,7 +22,8 @@ def sanitized_sarif(value: Any) -> dict[str, Any]:
         name = str(tool.get('name') or 'scanner')
         if not SAFE_ID.fullmatch(name):
             name = 'scanner'
-        source_rules = tool.get('rules') if isinstance(tool.get('rules'), list) else []
+        raw_rules = tool.get('rules')
+        source_rules = raw_rules if isinstance(raw_rules, list) else []
         rules: dict[str, dict[str, str]] = {}
         results: list[dict[str, Any]] = []
         for item in run.get('results', []):
@@ -29,13 +31,21 @@ def sanitized_sarif(value: Any) -> dict[str, Any]:
                 raise ValueError('Invalid SARIF result')
             rule = item.get('ruleId')
             index = item.get('ruleIndex')
-            if not rule and isinstance(index, int) and 0 <= index < len(source_rules) and isinstance(source_rules[index], dict):
+            if (
+                not rule
+                and isinstance(index, int)
+                and 0 <= index < len(source_rules)
+                and isinstance(source_rules[index], dict)
+            ):
                 rule = source_rules[index].get('id')
             rule = str(rule or 'unknown')
             if not SAFE_ID.fullmatch(rule):
                 rule = 'unknown'
             rules[rule] = {'id': rule}
-            result: dict[str, Any] = {'ruleId': rule, 'message': {'text': f'Finding {rule}; see the scanner report for details.'}}
+            result: dict[str, Any] = {
+                'ruleId': rule,
+                'message': {'text': f'Finding {rule}; see the scanner report for details.'},
+            }
             if item.get('level') in ('error', 'warning', 'note', 'none'):
                 result['level'] = item['level']
             locations = []
@@ -55,11 +65,20 @@ def sanitized_sarif(value: Any) -> dict[str, Any]:
                     uri = uri[7:]
                 elif uri.startswith('/') or '://' in uri:
                     continue
-                if not uri or any(part in ('', '.', '..') for part in uri.split('/')) or not re.fullmatch(r'[A-Za-z0-9_./+@-]+', uri):
+                if (
+                    not uri
+                    or any(part in ('', '.', '..') for part in uri.split('/'))
+                    or not re.fullmatch(r'[A-Za-z0-9_./+@-]+', uri)
+                ):
                     continue
                 out: dict[str, Any] = {'artifactLocation': {'uri': uri}}
                 region = physical.get('region') or {}
-                if isinstance(region, dict) and isinstance(region.get('startLine'), int) and not isinstance(region['startLine'], bool) and region['startLine'] > 0:
+                if (
+                    isinstance(region, dict)
+                    and isinstance(region.get('startLine'), int)
+                    and not isinstance(region['startLine'], bool)
+                    and region['startLine'] > 0
+                ):
                     out['region'] = {'startLine': region['startLine']}
                 locations.append({'physicalLocation': out})
             if locations:
@@ -88,16 +107,30 @@ def export_specialized_sarif(report: dict[str, Any], destination: Path) -> None:
             severity = str(item.get('severity') or '').upper()
             row: dict[str, Any] = {
                 'ruleId': item['rule'],
-                'locations': [{'physicalLocation': {
-                    'artifactLocation': {'uri': path},
-                    'region': {'startLine': item.get('line')},
-                }}],
+                'locations': [
+                    {
+                        'physicalLocation': {
+                            'artifactLocation': {'uri': path},
+                            'region': {'startLine': item.get('line')},
+                        }
+                    }
+                ],
             }
-            level = {'CRITICAL': 'error', 'HIGH': 'error', 'MEDIUM': 'warning',
-                     'MODERATE': 'warning', 'LOW': 'note'}.get(severity)
+            level = {
+                'CRITICAL': 'error',
+                'HIGH': 'error',
+                'MEDIUM': 'warning',
+                'MODERATE': 'warning',
+                'LOW': 'note',
+            }.get(severity)
             row['level'] = level or 'none'
             rows.append(row)
-        safe = sanitized_sarif({'version': '2.1.0', 'runs': [
-            {'tool': {'driver': {'name': scanner}}, 'results': rows},
-        ]})
+        safe = sanitized_sarif(
+            {
+                'version': '2.1.0',
+                'runs': [
+                    {'tool': {'driver': {'name': scanner}}, 'results': rows},
+                ],
+            }
+        )
         (destination / filename).write_text(json.dumps(safe, separators=(',', ':')) + '\n', encoding='utf-8')

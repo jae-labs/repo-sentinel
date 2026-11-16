@@ -17,6 +17,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
       - id: targets
         env:
           INVENTORY: ${{ inputs.inventory }}
@@ -36,6 +39,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
       - name: Resolve source revision
         timeout-minutes: 15
         id: clone
@@ -83,8 +89,12 @@ jobs:
           raw="$RUNNER_TEMP/semgrep-raw.json"
           log="$RUNNER_TEMP/semgrep.log"
           sarif="$RUNNER_TEMP/semgrep-raw.sarif"
-          trap 'rm -f "$raw" "$log" "$sarif"' EXIT
-          if ! timeout 20m semgrep scan --config p/security-audit --disable-nosem --metrics=off --disable-version-check --no-git-ignore --json --output "$raw" --sarif-output "$sarif" target 2>"$log"; then
+          rules="$RUNNER_TEMP/semgrep-rules.yml"
+          trap 'rm -f "$raw" "$log" "$sarif" "$rules"' EXIT
+          curl -fsSL --retry 3 --max-time 30 -o "$rules" https://semgrep.dev/c/p/security-audit
+          digest=$(sha256sum "$rules" | cut -d ' ' -f 1)
+          printf '%s  %s\n' "$digest" p/security-audit > semgrep-rules.sha256
+          if ! timeout 20m semgrep scan --config "$rules" --no-rewrite-rule-ids --disable-nosem --metrics=off --disable-version-check --no-git-ignore --json --output "$raw" --sarif-output "$sarif" target 2>"$log"; then
             echo 'Semgrep failed; scanner output withheld because it may contain source text.' >&2
             exit 1
           fi
@@ -119,7 +129,9 @@ jobs:
         if: ${{ always() && steps.clone.outcome == 'success' }}
         env:
           OSV_RESOLVE: ${{ toJSON(matrix.target.osv_resolve) }}
-        run: python3 -m sentinel specialized target
+        run: |
+          python3 -m pip install --group runtime
+          python3 -m sentinel specialized target
       - name: Export sanitized SARIF
         if: ${{ always() && steps.clone.outcome == 'success' }}
         timeout-minutes: 5
@@ -165,6 +177,7 @@ jobs:
             scan.log
             diagnostics.json
             semgrep.json
+            semgrep-rules.sha256
             specialized.json
             image-results.json
             image-scan.log
@@ -184,6 +197,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
       - name: Download scan reports
         if: needs.inventory.outputs.has_targets == 'true'
         continue-on-error: true
@@ -204,12 +220,15 @@ jobs:
             fi
           fi
       - name: Combine reports
+        id: aggregate
         env:
           INVENTORY: ${{ inputs.inventory }}
         run: python3 -m sentinel aggregate "$INVENTORY" scan-artifacts --cisa-catalog cisa-kev.json
       - name: Upload combined report
+        if: ${{ !cancelled() && (steps.aggregate.outcome == 'success' || steps.aggregate.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: combined-report
           path: combined-report.md
+          if-no-files-found: error
           retention-days: 30

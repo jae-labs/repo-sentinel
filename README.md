@@ -14,4 +14,15 @@ Unresolved versions fall back to the default branch. An unavailable `source_comm
 
 Each run publishes one summary with CISA KEV matches, grouped critical and high findings, and coverage gaps. Per-target Markdown, JSON, and SARIF artifacts are retained for 30 days.
 
-Run tests with `python3 -m unittest discover -s tests -v`.
+Missing or invalid required reports fail the run after the combined summary is written.
+Semgrep artifacts record the registry ruleset digest.
+
+Use Python 3.14 for local checks.
+
+```sh
+python -m pip install --group dev
+ruff check
+ruff format --check
+mypy
+python -m unittest discover -s tests -v
+```
